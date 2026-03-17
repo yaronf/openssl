@@ -53,9 +53,6 @@
  * Constants
  * ---------------------------------------------------------------------- */
 
-/* Default algorithm_validity_period advertised by the server (seconds). */
-#define PQC_DEFAULT_VALIDITY_PERIOD  (365 * 24 * 3600)  /* 1 year */
-
 /* PEM block type for cache entries. */
 #define PQC_PEM_TYPE  "PQC CERT AVAILABLE CACHE"
 
@@ -599,8 +596,13 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
 
         pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
         scheme = pqc_pkey_to_scheme(pctx, pkey);
-        if (scheme == 0) {
-            /* Traditional cert: send empty extension as presence signal. */
+        if (scheme == 0 || pctx->validity_period == 0) {
+            /*
+             * Traditional cert, or no ValidityPeriod configured: send empty
+             * extension as a presence signal only — no cache instruction.
+             * (validity_period == 0 on the wire means "clear cache", so we
+             * must not send it unless explicitly configured.)
+             */
             *out = NULL; *outlen = 0;
             return 1;
         }
@@ -693,7 +695,7 @@ int pqc_cont_init(SSL_CTX *ctx)
     if (pctx == NULL) return 0;
 
     pctx->enabled = 1;
-    pctx->validity_period = PQC_DEFAULT_VALIDITY_PERIOD;
+    /* validity_period stays 0 until set by ValidityPeriod in config */
 
     /* Read [pqc_continuity] from $OPENSSL_CONF; no-op if section absent. */
     {
@@ -720,6 +722,14 @@ int pqc_cont_init(SSL_CTX *ctx)
                     section_found = 1;
                     snprintf(alg_buf, sizeof(alg_buf), "%s", val);
                     alg_str = alg_buf;
+                } else {
+                    ERR_clear_error();
+                }
+
+                val = NCONF_get_string(conf, "pqc_continuity", "ValidityPeriod");
+                if (val != NULL) {
+                    section_found = 1;
+                    pctx->validity_period = (uint32_t)strtoul(val, NULL, 10);
                 } else {
                     ERR_clear_error();
                 }
