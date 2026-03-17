@@ -89,22 +89,19 @@ typedef struct {
  * Algorithm helpers
  * ---------------------------------------------------------------------- */
 
-/* Static name → TLS SignatureScheme table, from TLSEXT_SIGALG_* in ssl_local.h. */
-typedef struct { const char *name; uint16_t scheme; } pqc_scheme_entry_t;
-
-static const pqc_scheme_entry_t pqc_scheme_table[] = {
-    { "mldsa44",    TLSEXT_SIGALG_mldsa44 },
-    { "mldsa65",    TLSEXT_SIGALG_mldsa65 },
-    { "mldsa87",    TLSEXT_SIGALG_mldsa87 },
-    { NULL, 0 }
-};
-
-static uint16_t pqc_resolve_scheme(const char *name)
+/*
+ * Resolve a sigalg name to its TLS SignatureScheme value by walking the
+ * SSL_CTX's sigalg_lookup_cache — the same table SSL_set1_sigalgs_list()
+ * uses internally.  No hardcoded numeric values or manual table needed.
+ */
+static uint16_t pqc_resolve_scheme(SSL_CTX *ctx, const char *name)
 {
-    const pqc_scheme_entry_t *e;
-    for (e = pqc_scheme_table; e->name != NULL; e++)
-        if (strcasecmp(name, e->name) == 0)
-            return e->scheme;
+    size_t i;
+    for (i = 0; i < ctx->sigalg_lookup_cache_len; i++) {
+        const SIGALG_LOOKUP *lu = &ctx->sigalg_lookup_cache[i];
+        if (lu->name != NULL && strcasecmp(lu->name, name) == 0)
+            return lu->sigalg;
+    }
     return 0;
 }
 
@@ -137,7 +134,7 @@ static uint16_t pqc_pkey_to_scheme(const pqc_ctx_t *pctx, EVP_PKEY *pkey)
  * Parse a comma-separated algorithm list into pctx->algs[] and
  * build pctx->sigalgs_list (colon-separated, for SSL_set1_sigalgs_list).
  */
-static void pqc_parse_alg_list(pqc_ctx_t *pctx, const char *alg_str)
+static void pqc_parse_alg_list(pqc_ctx_t *pctx, SSL_CTX *ctx, const char *alg_str)
 {
     char buf[512];
     char *p, *tok, *save = NULL;
@@ -168,7 +165,7 @@ static void pqc_parse_alg_list(pqc_ctx_t *pctx, const char *alg_str)
         if (pctx->nalgs >= PQC_MAX_ALGS) break;
 
         {
-            uint16_t scheme = pqc_resolve_scheme(tok);
+            uint16_t scheme = pqc_resolve_scheme(ctx, tok);
             if (scheme == 0) {
                 fprintf(stderr, "pqc_continuity: unknown algorithm '%s', skipping\n", tok);
                 continue;
@@ -738,7 +735,7 @@ int pqc_cont_init(SSL_CTX *ctx)
     }
 
     if (alg_str != NULL)
-        pqc_parse_alg_list(pctx, alg_str);
+        pqc_parse_alg_list(pctx, ctx, alg_str);
 
     if (pctx->nalgs == 0 && pctx->enabled) {
         fprintf(stderr, "pqc_continuity: no valid PQC algorithms configured, "
