@@ -162,6 +162,9 @@ extern "C" {
 /* Temporary extension type */
 #define TLSEXT_TYPE_renegotiate 0xff01
 
+/* PQC Continuity extension (draft-sheffer-tls-pqc-continuity, experimental) */
+#define TLSEXT_TYPE_pq_cert_available 0xfe01
+
 #ifndef OPENSSL_NO_NEXTPROTONEG
 /* This is not an IANA defined extension number */
 #define TLSEXT_TYPE_next_proto_neg 13172

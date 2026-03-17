@@ -4284,6 +4284,9 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
         goto err;
     }
 
+    /* PQC Continuity: auto-register pq_cert_available if [pqc_continuity] is in config */
+    pqc_cont_init(ret);
+
 #ifndef OPENSSL_NO_SSLKEYLOG
     if (keylogfile != NULL && strlen(keylogfile) != 0) {
         /* Make sure we have a global lock allocated */

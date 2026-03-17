@@ -3013,6 +3013,9 @@ void custom_exts_free(custom_ext_methods *exts);
 /* ssl_mcnf.c */
 int ssl_ctx_system_config(SSL_CTX *ctx);
 
+/* pqc_continuity.c */
+int pqc_cont_init(SSL_CTX *ctx);
+
 const EVP_CIPHER *ssl_evp_cipher_fetch(OSSL_LIB_CTX *libctx,
     int nid,
     const char *properties);
