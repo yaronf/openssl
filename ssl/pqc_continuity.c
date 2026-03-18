@@ -20,6 +20,7 @@
  */
 
 #include "ssl_local.h"
+#include "internal/thread_once.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -84,14 +85,14 @@ typedef struct {
 #define PQC_DEBUG_LEGACY_SCHEME    0x04  /* server sends RSA scheme in CT */
 #define PQC_DEBUG_MALFORMED_EXT    0x08  /* server sends wrong-length CT ext */
 #define PQC_DEBUG_UNKNOWN_SCHEME        0x10  /* server sends unregistered scheme */
-#define PQC_DEBUG_CT_ON_INTERMEDIATE    0x40  /* server sends CT on intermediate cert (chainidx 1) */
+#define PQC_DEBUG_CT_ON_INTERMEDIATE    0x40  /* server sends CT on both EE (chainidx 0) AND intermediate (chainidx 1) */
+#define PQC_DEBUG_CT_ONLY_INTERMEDIATE  0x80  /* server sends CT on intermediate (chainidx 1) ONLY, skipping EE */
 
 /* Per-context state, passed via add_arg / parse_arg. */
 typedef struct {
     uint32_t     validity_period;
     char         cache_path[512];
     int          cache_enabled; /* 1 if CachePath was set; 0 = no persistence */
-    int          server_sent_cr;
     uint32_t     debug_mask;  /* fault injection bitmask; 0 in production */
     pqc_entry_t *cache;     /* heap-allocated, grown with OPENSSL_realloc */
     int          ncache;
@@ -122,11 +123,26 @@ typedef struct {
     int              port;
     time_t           expiry;       /* only valid for PQC_PENDING_UPDATE */
     int              client_sent_ch; /* server-side: 1 if client included CH ext */
+    int              server_sent_cr; /* client-side: 1 if server included CR ext */
     int (*prev_verify_cb)(int, X509_STORE_CTX *); /* chained verify callback */
 } pqc_conn_t;
 
-/* SSL ex_data index for pqc_conn_t; initialised once in pqc_cont_init(). */
-static int pqc_conn_ex_idx = -1;
+/*
+ * SSL ex_data index for pqc_conn_t.
+ * Initialised exactly once (thread-safe) via CRYPTO_THREAD_run_once.
+ */
+static int         pqc_conn_ex_idx  = -1;
+static CRYPTO_ONCE pqc_ex_idx_once  = CRYPTO_ONCE_STATIC_INIT;
+
+/* Forward declaration — defined below near the ex_data lifecycle section. */
+static void pqc_conn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+                           int idx, long argl, void *argp);
+
+DEFINE_RUN_ONCE_STATIC(pqc_ex_idx_init)
+{
+    pqc_conn_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, pqc_conn_free);
+    return (pqc_conn_ex_idx >= 0);
+}
 
 /* -------------------------------------------------------------------------
  * Global PQC algorithm registry
@@ -184,10 +200,24 @@ static pqc_alg_t pqc_alg_registry[] = {
     { 0 }  /* sentinel */
 };
 
-/* Dynamic extensions registered via pqc_cont_register_sigalg(). */
-static pqc_alg_t  *pqc_dyn_registry  = NULL;
-static int         pqc_dyn_nalloc    = 0;
-static int         pqc_dyn_nentries  = 0;
+/*
+ * Dynamic sigalg registry — runtime extension via pqc_cont_register_sigalg().
+ * Protected by pqc_dyn_lock (readers during lookup, writer during registration).
+ * Note: the registry is used only for pqc_build_sigalgs_list() and
+ * pqc_pkey_to_scheme(); parse_cb validation is done by cert-key comparison,
+ * not by registry membership.
+ */
+static pqc_alg_t    *pqc_dyn_registry  = NULL;
+static int           pqc_dyn_nalloc    = 0;
+static int           pqc_dyn_nentries  = 0;
+static CRYPTO_RWLOCK *pqc_dyn_lock     = NULL;
+static CRYPTO_ONCE   pqc_dyn_lock_once = CRYPTO_ONCE_STATIC_INIT;
+
+DEFINE_RUN_ONCE_STATIC(pqc_dyn_lock_init)
+{
+    pqc_dyn_lock = CRYPTO_THREAD_lock_new();
+    return (pqc_dyn_lock != NULL);
+}
 
 /*
  * Register an additional PQC sigalg at runtime (e.g., from a provider).
@@ -196,30 +226,51 @@ static int         pqc_dyn_nentries  = 0;
 int pqc_cont_register_sigalg(uint16_t scheme)
 {
     pqc_alg_t *p;
+    int ret = 0;
+
     if (scheme == 0) return 0;
+    if (!RUN_ONCE(&pqc_dyn_lock_once, pqc_dyn_lock_init)) return 0;
+    if (!CRYPTO_THREAD_write_lock(pqc_dyn_lock)) return 0;
+
     if (pqc_dyn_nentries >= pqc_dyn_nalloc) {
         int newalloc = pqc_dyn_nalloc == 0 ? 4 : pqc_dyn_nalloc * 2;
         p = OPENSSL_realloc(pqc_dyn_registry, newalloc * sizeof(pqc_alg_t));
-        if (p == NULL) return 0;
-        pqc_dyn_registry = p;
-        pqc_dyn_nalloc = newalloc;
+        if (p != NULL) {
+            pqc_dyn_registry = p;
+            pqc_dyn_nalloc = newalloc;
+        }
     }
-    pqc_dyn_registry[pqc_dyn_nentries].scheme = scheme;
-    pqc_dyn_nentries++;
-    return 1;
+    if (pqc_dyn_nentries < pqc_dyn_nalloc) {
+        pqc_dyn_registry[pqc_dyn_nentries].scheme = scheme;
+        pqc_dyn_nentries++;
+        ret = 1;
+    }
+
+    CRYPTO_THREAD_unlock(pqc_dyn_lock);
+    return ret;
 }
 
 /* Look up a scheme value in the combined (static + dynamic) registry. */
 static const pqc_alg_t *pqc_alg_by_scheme(uint16_t scheme)
 {
     int i;
+    const pqc_alg_t *found = NULL;
+
     for (i = 0; pqc_alg_registry[i].scheme != 0; i++)
         if (pqc_alg_registry[i].scheme == scheme)
             return &pqc_alg_registry[i];
-    for (i = 0; i < pqc_dyn_nentries; i++)
-        if (pqc_dyn_registry[i].scheme == scheme)
-            return &pqc_dyn_registry[i];
-    return NULL;
+
+    /* Dynamic registry requires lock. */
+    if (pqc_dyn_lock != NULL && CRYPTO_THREAD_read_lock(pqc_dyn_lock)) {
+        for (i = 0; i < pqc_dyn_nentries; i++) {
+            if (pqc_dyn_registry[i].scheme == scheme) {
+                found = &pqc_dyn_registry[i];
+                break;
+            }
+        }
+        CRYPTO_THREAD_unlock(pqc_dyn_lock);
+    }
+    return found;
 }
 
 /*
@@ -371,7 +422,10 @@ static int pqc_cache_lookup(const pqc_ctx_t *pctx, const char *host, int port,
  */
 static int pqc_cache_persist(pqc_ctx_t *pctx)
 {
-    char tmppath[528];
+    /* Suffix ".tmp.XXXXXX" = 11 chars + NUL; assert we have room. */
+    _Static_assert(sizeof(((pqc_ctx_t *)0)->cache_path) + 12
+                   <= 528, "tmppath too small for cache_path + suffix");
+    char tmppath[sizeof(((pqc_ctx_t *)0)->cache_path) + 12];
     BIO *wbio = NULL;
     int i, ret = 0;
 #ifdef _WIN32
@@ -409,8 +463,7 @@ static int pqc_cache_persist(pqc_ctx_t *pctx)
             OPENSSL_free(der);
         }
     }
-    BIO_flush(wbio);
-    BIO_free(wbio); wbio = NULL;
+    BIO_free(wbio); wbio = NULL;  /* BIO_free on a file BIO flushes implicitly */
 
 #ifdef _WIN32
     DeleteFileA(path);
@@ -460,9 +513,10 @@ static int pqc_cache_update(pqc_ctx_t *pctx, const char *host, int port,
     } else if (expiry < pctx->cache[i].expiry) {
         /* Draft 3.3: SHOULD NOT accept a decrease in validity period.
          * Leave the existing (longer) expiry untouched. */
-        fprintf(stderr, "pqc_continuity: ignoring validity decrease for %s:%d "
-                "(cached=%ld, offered=%ld)\n",
-                host, port, (long)pctx->cache[i].expiry, (long)expiry);
+        if (pctx->debug_mask != 0)
+            fprintf(stderr, "pqc_continuity: ignoring validity decrease for %s:%d "
+                    "(cached=%ld, offered=%ld)\n",
+                    host, port, (long)pctx->cache[i].expiry, (long)expiry);
         return 1;
     }
     pctx->cache[i].expiry = expiry;
@@ -673,12 +727,13 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
         if (conn == NULL || conn->op == PQC_PENDING_NONE) return;
 
         vresult = SSL_get_verify_result(ssl);
-        fprintf(stderr, "pqc_continuity: handshake done, verify_result=%ld (%s), pending_op=%d for %s:%d\n",
-                vresult, (vresult == X509_V_OK ? "OK" : "FAIL"),
-                conn->op, conn->host, conn->port);
+        if (conn->pctx != NULL && conn->pctx->debug_mask != 0)
+            fprintf(stderr, "pqc_continuity: handshake done, verify_result=%ld (%s), "
+                    "pending_op=%d for %s:%d\n",
+                    vresult, (vresult == X509_V_OK ? "OK" : "FAIL"),
+                    conn->op, conn->host, conn->port);
 
         if (vresult != X509_V_OK) {
-            fprintf(stderr, "pqc_continuity: discarding pending cache write — cert verification failed\n");
             conn->op = PQC_PENDING_NONE;
             return;
         }
@@ -741,30 +796,18 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
         }
 
         pqc_get_host_port(s, host, sizeof(host), &port);
-        fprintf(stderr, "pqc_continuity: CH add_cb host=%s port=%d ncache=%d\n",
-                host, port, pctx->ncache);
         if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
             char sigalgs[512];
             SSL_CTX *sctx = SSL_get_SSL_CTX(s);
-            fprintf(stderr, "pqc_continuity: cache hit for %s:%d expiry=%ld, building sigalgs list (cache_len=%zu)\n",
-                    host, port, (long)cached_expiry, sctx->sigalg_lookup_cache_len);
             if (pqc_build_sigalgs_list(sctx, sigalgs, sizeof(sigalgs))) {
-                fprintf(stderr, "pqc_continuity: restricting sigalgs to: %s\n", sigalgs);
+                if (pctx->debug_mask != 0)
+                    fprintf(stderr, "pqc_continuity: cache hit %s:%d, restricting sigalgs to: %s\n",
+                            host, port, sigalgs);
                 SSL_set1_sigalgs_list(s, sigalgs);
-            } else {
-                fprintf(stderr, "pqc_continuity: pqc_build_sigalgs_list returned 0 (no PQC sigalgs in lookup cache)\n");
-                /* Dump first few entries to diagnose */
-                {
-                    size_t k;
-                    for (k = 0; k < sctx->sigalg_lookup_cache_len && k < 20; k++) {
-                        const SIGALG_LOOKUP *lu = &sctx->sigalg_lookup_cache[k];
-                        fprintf(stderr, "  sigalg_lookup_cache[%zu]: sigalg=0x%04x name=%s sig=%d\n",
-                                k, lu->sigalg, lu->name ? lu->name : "(null)", lu->sig);
-                    }
-                }
+            } else if (pctx->debug_mask != 0) {
+                fprintf(stderr, "pqc_continuity: cache hit %s:%d but no PQC sigalgs in lookup cache\n",
+                        host, port);
             }
-        } else {
-            fprintf(stderr, "pqc_continuity: no cache hit for %s:%d\n", host, port);
         }
 
         *out = NULL; *outlen = 0;
@@ -782,12 +825,22 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
         uint16_t scheme;
         unsigned char *buf;
 
-        /* Debug: CT_ON_INTERMEDIATE — inject CT on the intermediate (chainidx 1),
-         * skipping chainidx 0 entirely so the extension lands in the wrong place. */
-        if (pctx->debug_mask & PQC_DEBUG_CT_ON_INTERMEDIATE) {
+        /* Debug: CT_ON_INTERMEDIATE — also inject CT on chainidx 1 (in addition to
+         * the normal chainidx 0 extension).  This gives two separate test scenarios:
+         *   A4a: extension on both EE (0) and intermediate (1) — client sees it on 0
+         *        first, processes it, then receives it again on 1 → illegal_parameter.
+         *   A4b: extension on chainidx 1 only (use CT_ON_INTERMEDIATE without this
+         *        flag and skip chainidx 0 via the else branch) — tested separately.
+         * The flag allows 0 and 1; the normal path only allows 0. */
+        if (pctx->debug_mask & PQC_DEBUG_CT_ONLY_INTERMEDIATE) {
+            /* Send CT on chainidx 1 only — EE gets no extension. */
             if (chainidx != 1) return 0;
-            fprintf(stderr, "pqc_continuity: [debug] CT_ON_INTERMEDIATE — injecting CT on chainidx 1\n");
-            /* Fall through to normal CT encoding below (using chainidx 1's cert). */
+            fprintf(stderr, "pqc_continuity: [debug] CT_ONLY_INTERMEDIATE — sending CT on chainidx 1 only\n");
+        } else if (pctx->debug_mask & PQC_DEBUG_CT_ON_INTERMEDIATE) {
+            /* Send CT on both chainidx 0 (normal) and chainidx 1 (injected). */
+            if (chainidx > 1) return 0;
+            if (chainidx == 1)
+                fprintf(stderr, "pqc_continuity: [debug] CT_ON_INTERMEDIATE — also sending CT on chainidx 1\n");
         } else if (chainidx != 0) {
             return 0;
         }
@@ -800,7 +853,8 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
             pqc_conn_t *conn = (pqc_conn_ex_idx >= 0)
                                ? SSL_get_ex_data(s, pqc_conn_ex_idx) : NULL;
             if (conn == NULL || !conn->client_sent_ch) {
-                fprintf(stderr, "pqc_continuity: server skipping CT — client did not send CH\n");
+                if (pctx->debug_mask != 0)
+                    fprintf(stderr, "pqc_continuity: server skipping CT — client did not send CH\n");
                 return 0;
             }
         }
@@ -941,8 +995,11 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
     }
 
     if (context & SSL_EXT_TLS1_3_CERTIFICATE_REQUEST) {
-        if (!SSL_is_server(s))
-            pctx->server_sent_cr = 1;
+        if (!SSL_is_server(s)) {
+            pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
+            if (conn != NULL)
+                conn->server_sent_cr = 1;
+        }
         return 1;
     }
 
@@ -1030,8 +1087,9 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
                         conn->op     = PQC_PENDING_UPDATE;
                         conn->expiry = time(NULL) + (time_t)validity;
                     }
-                    fprintf(stderr, "pqc_continuity: CT parse_cb deferring cache %s for %s:%d\n",
-                            validity == 0 ? "delete" : "update", host, port);
+                    if (pctx->debug_mask != 0)
+                        fprintf(stderr, "pqc_continuity: CT parse_cb deferring cache %s for %s:%d\n",
+                                validity == 0 ? "delete" : "update", host, port);
                 }
             }
         }
@@ -1050,12 +1108,9 @@ int pqc_cont_init(SSL_CTX *ctx)
     int section_found = 0;
     unsigned int contexts;
 
-    /* Register SSL ex_data slot once (idempotent via CRYPTO_get_ex_new_index). */
-    if (pqc_conn_ex_idx < 0) {
-        pqc_conn_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL,
-                                                pqc_conn_free);
-        if (pqc_conn_ex_idx < 0) return 0;
-    }
+    /* Register SSL ex_data slot exactly once, thread-safely. */
+    if (!RUN_ONCE(&pqc_ex_idx_once, pqc_ex_idx_init))
+        return 0;
 
     pctx = OPENSSL_zalloc(sizeof(*pctx));
     if (pctx == NULL) return 0;
