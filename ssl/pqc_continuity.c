@@ -87,6 +87,34 @@ typedef struct {
     int          cache_cap;
 } pqc_ctx_t;
 
+/*
+ * Per-connection pending cache intent.
+ *
+ * The CT parse_cb fires during tls_process_server_certificate(), before
+ * ssl_verify_cert_chain() runs.  We must not write the cache until we know
+ * the peer's certificate chain is trusted.  This struct holds the intent
+ * (update or delete) and is flushed in pqc_info_cb() at SSL_CB_HANDSHAKE_DONE
+ * only if SSL_get_verify_result() == X509_V_OK.
+ *
+ * Stored as SSL ex_data (index pqc_conn_ex_idx).
+ */
+typedef enum {
+    PQC_PENDING_NONE   = 0,
+    PQC_PENDING_UPDATE = 1,  /* write/refresh cache entry */
+    PQC_PENDING_DELETE = 2   /* remove cache entry (validity == 0) */
+} pqc_pending_op_t;
+
+typedef struct {
+    pqc_ctx_t       *pctx;   /* back-pointer to per-context state */
+    pqc_pending_op_t op;
+    char             host[256];
+    int              port;
+    time_t           expiry;  /* only valid for PQC_PENDING_UPDATE */
+} pqc_conn_t;
+
+/* SSL ex_data index for pqc_conn_t; initialised once in pqc_cont_init(). */
+static int pqc_conn_ex_idx = -1;
+
 /* -------------------------------------------------------------------------
  * Global PQC algorithm registry
  *
@@ -510,6 +538,88 @@ static int pqc_build_sigalgs_list(SSL_CTX *ctx, char *buf, size_t buflen)
 }
 
 /* -------------------------------------------------------------------------
+ * Per-connection ex_data lifecycle
+ * ---------------------------------------------------------------------- */
+
+static void pqc_conn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
+                           int idx, long argl, void *argp)
+{
+    OPENSSL_free(ptr);
+}
+
+/*
+ * Return (allocating if necessary) the pqc_conn_t for this SSL object.
+ * Returns NULL on allocation failure.
+ */
+static pqc_conn_t *pqc_conn_get_or_create(SSL *s, pqc_ctx_t *pctx)
+{
+    pqc_conn_t *conn;
+
+    if (pqc_conn_ex_idx < 0) return NULL;
+    conn = SSL_get_ex_data(s, pqc_conn_ex_idx);
+    if (conn != NULL) return conn;
+
+    conn = OPENSSL_zalloc(sizeof(*conn));
+    if (conn == NULL) return NULL;
+    conn->pctx = pctx;
+    if (!SSL_set_ex_data(s, pqc_conn_ex_idx, conn)) {
+        OPENSSL_free(conn);
+        return NULL;
+    }
+    return conn;
+}
+
+/* -------------------------------------------------------------------------
+ * Info callback — fires at SSL_CB_HANDSHAKE_DONE.
+ * Flushes the pending cache intent only if cert verification succeeded.
+ * Chains the CTX-level info callback so apps using -state/-msg still work.
+ * ---------------------------------------------------------------------- */
+
+static void pqc_info_cb(const SSL *ssl, int where, int ret)
+{
+    /* Chain CTX-level callback first (it was there before we set ours). */
+    {
+        void (*ctx_cb)(const SSL *, int, int) =
+            SSL_CTX_get_info_callback(SSL_get_SSL_CTX(ssl));
+        if (ctx_cb != NULL && ctx_cb != pqc_info_cb)
+            ctx_cb(ssl, where, ret);
+    }
+
+    if (where != SSL_CB_HANDSHAKE_DONE) return;
+
+    /* Only flush on the client side: server's peer cert (client auth) is a
+     * separate concern; skip for now (H4 semantics undefined in draft). */
+    if (SSL_is_server(ssl)) return;
+
+    {
+        pqc_conn_t *conn;
+        long vresult;
+
+        if (pqc_conn_ex_idx < 0) return;
+        conn = SSL_get_ex_data(ssl, pqc_conn_ex_idx);
+        if (conn == NULL || conn->op == PQC_PENDING_NONE) return;
+
+        vresult = SSL_get_verify_result(ssl);
+        fprintf(stderr, "pqc_continuity: handshake done, verify_result=%ld (%s), pending_op=%d for %s:%d\n",
+                vresult, (vresult == X509_V_OK ? "OK" : "FAIL"),
+                conn->op, conn->host, conn->port);
+
+        if (vresult != X509_V_OK) {
+            fprintf(stderr, "pqc_continuity: discarding pending cache write — cert verification failed\n");
+            conn->op = PQC_PENDING_NONE;
+            return;
+        }
+
+        if (conn->op == PQC_PENDING_UPDATE)
+            pqc_cache_update(conn->pctx, conn->host, conn->port, conn->expiry);
+        else if (conn->op == PQC_PENDING_DELETE)
+            pqc_cache_delete(conn->pctx, conn->host, conn->port);
+
+        conn->op = PQC_PENDING_NONE;
+    }
+}
+
+/* -------------------------------------------------------------------------
  * Extension callbacks
  * ---------------------------------------------------------------------- */
 
@@ -536,6 +646,13 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
          * offer traditional sigalgs to a server it has previously seen with a
          * PQC certificate.
          */
+        /*
+         * Install our per-SSL info callback now, before any app callback is
+         * set on this SSL object.  pqc_info_cb chains the CTX-level callback
+         * so apps using -state/-msg continue to work.
+         */
+        SSL_set_info_callback(s, pqc_info_cb);
+
         pqc_get_host_port(s, host, sizeof(host), &port);
         fprintf(stderr, "pqc_continuity: CH add_cb host=%s port=%d ncache=%d\n",
                 host, port, pctx->ncache);
@@ -682,11 +799,27 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
             if (pqc_alg_by_scheme(scheme) == NULL)
                 return 1; /* not a known PQC alg: ignore per §3.3 */
 
-            if (validity == 0)
-                pqc_cache_delete(pctx, host, port);
-            else
-                pqc_cache_update(pctx, host, port,
-                                 time(NULL) + (time_t)validity);
+            /*
+             * Do NOT write the cache here.  This callback fires before
+             * ssl_verify_cert_chain() — the peer's cert is not yet verified.
+             * Record the intent; pqc_info_cb() flushes it at
+             * SSL_CB_HANDSHAKE_DONE after confirming X509_V_OK.
+             */
+            {
+                pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
+                if (conn != NULL) {
+                    snprintf(conn->host, sizeof(conn->host), "%s", host);
+                    conn->port = port;
+                    if (validity == 0) {
+                        conn->op = PQC_PENDING_DELETE;
+                    } else {
+                        conn->op     = PQC_PENDING_UPDATE;
+                        conn->expiry = time(NULL) + (time_t)validity;
+                    }
+                    fprintf(stderr, "pqc_continuity: CT parse_cb deferring cache %s for %s:%d\n",
+                            validity == 0 ? "delete" : "update", host, port);
+                }
+            }
         }
     }
 
@@ -702,6 +835,13 @@ int pqc_cont_init(SSL_CTX *ctx)
     pqc_ctx_t *pctx;
     int section_found = 0;
     unsigned int contexts;
+
+    /* Register SSL ex_data slot once (idempotent via CRYPTO_get_ex_new_index). */
+    if (pqc_conn_ex_idx < 0) {
+        pqc_conn_ex_idx = SSL_get_ex_new_index(0, NULL, NULL, NULL,
+                                                pqc_conn_free);
+        if (pqc_conn_ex_idx < 0) return 0;
+    }
 
     pctx = OPENSSL_zalloc(sizeof(*pctx));
     if (pctx == NULL) return 0;
