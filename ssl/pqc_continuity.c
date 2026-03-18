@@ -80,12 +80,11 @@ typedef struct {
  * Debug bitmask (Debug config key, hex) for fault injection in tests.
  * See docs/POC-PLAN.md § Debug Bitmask.
  */
-#define PQC_DEBUG_SUPPRESS_CT_EXT  0x01  /* server omits CT extension */
 #define PQC_DEBUG_WRONG_SCHEME     0x02  /* server sends mismatched PQC scheme */
 #define PQC_DEBUG_LEGACY_SCHEME    0x04  /* server sends RSA scheme in CT */
 #define PQC_DEBUG_MALFORMED_EXT    0x08  /* server sends wrong-length CT ext */
-#define PQC_DEBUG_UNKNOWN_SCHEME   0x10  /* server sends unregistered scheme */
-#define PQC_DEBUG_SUPPRESS_CH_EXT  0x20  /* client omits CH extension */
+#define PQC_DEBUG_UNKNOWN_SCHEME        0x10  /* server sends unregistered scheme */
+#define PQC_DEBUG_CT_ON_INTERMEDIATE    0x40  /* server sends CT on intermediate cert (chainidx 1) */
 
 /* Per-context state, passed via add_arg / parse_arg. */
 typedef struct {
@@ -423,8 +422,14 @@ static int pqc_cache_persist(pqc_ctx_t *pctx)
     unlink(tmppath);
 
 fail:
-    fprintf(stderr, "pqc_continuity: cache write failed for %s, disabling cache\n",
-            pctx->cache_path);
+    {
+        static int warned = 0;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr, "pqc_continuity: cache write failed for %s, disabling cache\n",
+                    pctx->cache_path);
+        }
+    }
     pctx->cache_enabled = 0;
     return 0;
 }
@@ -452,6 +457,13 @@ static int pqc_cache_update(pqc_ctx_t *pctx, const char *host, int port,
         i = pctx->ncache++;
         snprintf(pctx->cache[i].host, sizeof(pctx->cache[i].host), "%s", host);
         pctx->cache[i].port = port;
+    } else if (expiry < pctx->cache[i].expiry) {
+        /* Draft 3.3: SHOULD NOT accept a decrease in validity period.
+         * Leave the existing (longer) expiry untouched. */
+        fprintf(stderr, "pqc_continuity: ignoring validity decrease for %s:%d "
+                "(cached=%ld, offered=%ld)\n",
+                host, port, (long)pctx->cache[i].expiry, (long)expiry);
+        return 1;
     }
     pctx->cache[i].expiry = expiry;
     if (pctx->cache_enabled)
@@ -701,11 +713,6 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
 
         if (SSL_is_server(s)) return 0;
 
-        /* Debug: SUPPRESS_CH_EXT — client omits CH extension. */
-        if (pctx->debug_mask & PQC_DEBUG_SUPPRESS_CH_EXT) {
-            fprintf(stderr, "pqc_continuity: [debug] SUPPRESS_CH_EXT — omitting CH extension\n");
-            return 0;
-        }
 
         /*
          * Cache hit: restrict this connection to PQC signature algorithms only.
@@ -775,7 +782,15 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
         uint16_t scheme;
         unsigned char *buf;
 
-        if (chainidx != 0) return 0;
+        /* Debug: CT_ON_INTERMEDIATE — inject CT on the intermediate (chainidx 1),
+         * skipping chainidx 0 entirely so the extension lands in the wrong place. */
+        if (pctx->debug_mask & PQC_DEBUG_CT_ON_INTERMEDIATE) {
+            if (chainidx != 1) return 0;
+            fprintf(stderr, "pqc_continuity: [debug] CT_ON_INTERMEDIATE — injecting CT on chainidx 1\n");
+            /* Fall through to normal CT encoding below (using chainidx 1's cert). */
+        } else if (chainidx != 0) {
+            return 0;
+        }
 
         /*
          * Server: only send CT if client included the CH extension (P1).
@@ -788,12 +803,6 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
                 fprintf(stderr, "pqc_continuity: server skipping CT — client did not send CH\n");
                 return 0;
             }
-        }
-
-        /* Debug: SUPPRESS_CT_EXT — server omits CT extension entirely. */
-        if (pctx->debug_mask & PQC_DEBUG_SUPPRESS_CT_EXT) {
-            fprintf(stderr, "pqc_continuity: [debug] SUPPRESS_CT_EXT — omitting CT extension\n");
-            return 0;
         }
 
         pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
@@ -941,7 +950,16 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
         char host[256];
         int port = 0;
 
-        if (chainidx != 0) return 1;
+        if (chainidx != 0) {
+            /* CT extension on a non-EE CertificateEntry is a protocol violation. */
+            if (!SSL_is_server(s)) {
+                fprintf(stderr, "pqc_continuity: CT extension on chainidx %zu (not EE) — aborting\n",
+                        chainidx);
+                *al = SSL_AD_ILLEGAL_PARAMETER;
+                return 0;
+            }
+            return 1;
+        }
 
         pqc_get_host_port(s, host, sizeof(host), &port);
 
@@ -975,21 +993,23 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
             uint32_t validity = ((uint32_t)in[2] << 24) | ((uint32_t)in[3] << 16)
                               | ((uint32_t)in[4] <<  8) |  (uint32_t)in[5];
 
-            if (pqc_alg_by_scheme(scheme) == NULL)
-                return 1; /* not a known PQC alg: ignore per §3.3 */
-
             /*
-             * Validate: scheme in extension must match the cert's actual key.
-             * A mismatched scheme (e.g. from a WRONG_SCHEME fault injection or a
-             * MitM rewrite) must be rejected — do not cache.
+             * The scheme in the extension must exactly match the cert's actual
+             * public key.  Any deviation — wrong PQC alg, legacy alg, or
+             * unknown value — is treated as tampering: abort with
+             * illegal_parameter.  There is no forward-compat carve-out for
+             * unknown schemes; if the server sends an extension it must be
+             * consistent with the cert it is presenting.
              */
-            if (x != NULL && !SSL_is_server(s)) {
-                EVP_PKEY *pkey = X509_get0_pubkey(x);
+            if (!SSL_is_server(s)) {
+                EVP_PKEY *pkey = x != NULL ? X509_get0_pubkey(x) : NULL;
                 uint16_t cert_scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
-                if (cert_scheme != 0 && cert_scheme != scheme) {
-                    fprintf(stderr, "pqc_continuity: CT parse_cb scheme mismatch: extension=0x%04x cert=0x%04x — ignoring\n",
+                if (cert_scheme == 0 || cert_scheme != scheme) {
+                    fprintf(stderr, "pqc_continuity: CT parse_cb scheme mismatch: "
+                            "extension=0x%04x cert=0x%04x — aborting\n",
                             scheme, cert_scheme);
-                    return 1; /* mismatch: ignore extension, do not cache */
+                    *al = SSL_AD_ILLEGAL_PARAMETER;
+                    return 0;
                 }
             }
 
