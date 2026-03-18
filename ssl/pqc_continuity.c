@@ -26,6 +26,13 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#ifndef _WIN32
+# include <sys/socket.h>
+# include <netinet/in.h>
+#else
+# include <winsock2.h>
+# include <ws2tcpip.h>
+#endif
 
 
 #include <openssl/ssl.h>
@@ -85,7 +92,7 @@ typedef struct {
  *
  * Static table of all known NIST PQC sigalgs with IANA-assigned TLS
  * SignatureScheme values.  Algorithms not yet supported by the current
- * OpenSSL build are silently skipped at init (pqc_resolve_scheme → 0)
+ * OpenSSL build are silently skipped (pqc_pkey_to_scheme returns 0 for them)
  * and activate automatically once the build adds support.
  *
  * The bar to add an algorithm here is intentionally low: the TLS stack
@@ -175,34 +182,37 @@ static const pqc_alg_t *pqc_alg_by_scheme(uint16_t scheme)
 }
 
 /*
- * Resolve a sigalg name to its TLS SignatureScheme value by walking the
- * SSL_CTX's sigalg_lookup_cache — the same table SSL_set1_sigalgs_list()
- * uses internally.
+ * Map a pkey to its TLS SignatureScheme value by matching the pkey's base NID
+ * against the SSL_CTX's sigalg_lookup_cache.  Name matching is unreliable
+ * because EVP_PKEY_get0_type_name() returns the OID long name (e.g.
+ * "ML-DSA-44") while sigalg_lookup_cache uses the TLS name (e.g. "mldsa44").
  */
-static uint16_t pqc_resolve_scheme(SSL_CTX *ctx, const char *name)
+static uint16_t pqc_pkey_to_scheme(SSL_CTX *ctx, EVP_PKEY *pkey)
 {
+    int nid = NID_undef;
     size_t i;
+
+    if (pkey == NULL) return 0;
+
+    /*
+     * For provider-based keys (e.g. ML-DSA), EVP_PKEY_get_base_id() returns
+     * NID_undef.  Use ssl_cert_lookup_by_pkey() instead, which uses
+     * EVP_PKEY_is_a() against OID short/long names and handles provider keys.
+     */
+    {
+        const SSL_CERT_LOOKUP *scl = ssl_cert_lookup_by_pkey(pkey, NULL, ctx);
+        if (scl != NULL)
+            nid = scl->pkey_nid;
+    }
+    if (nid == NID_undef) return 0;
+
     for (i = 0; i < ctx->sigalg_lookup_cache_len; i++) {
         const SIGALG_LOOKUP *lu = &ctx->sigalg_lookup_cache[i];
-        if (lu->name != NULL && strcasecmp(lu->name, name) == 0)
+        if (lu->sig == nid && lu->sigalg != 0
+                && pqc_alg_by_scheme(lu->sigalg) != NULL)
             return lu->sigalg;
     }
     return 0;
-}
-
-/* Return the scheme for a PQC pkey if it's in the registry, else 0. */
-static uint16_t pqc_pkey_to_scheme(SSL_CTX *ctx, EVP_PKEY *pkey)
-{
-    const char *alg_name;
-    uint16_t scheme;
-
-    if (pkey == NULL) return 0;
-    alg_name = EVP_PKEY_get0_type_name(pkey);
-    if (alg_name == NULL) return 0;
-    scheme = pqc_resolve_scheme(ctx, alg_name);
-    if (scheme == 0) return 0;
-    /* Confirm it's in the PQC registry (not just any sigalg). */
-    return pqc_alg_by_scheme(scheme) != NULL ? scheme : 0;
 }
 
 
@@ -215,16 +225,52 @@ static void pqc_get_host_port(SSL *s, char *host, size_t hostlen, int *port)
     const char *sni = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
     BIO *rbio = SSL_get_rbio(s);
 
+    /* Host: prefer SNI; fall back to BIO conn hostname. */
     if (sni != NULL && sni[0] != '\0') {
         snprintf(host, hostlen, "%s", sni);
     } else {
-        const char *h = (rbio != NULL) ? BIO_get_conn_hostname(rbio) : NULL;
-        snprintf(host, hostlen, "%s", (h != NULL) ? h : "localhost");
+        const char *h = NULL;
+        BIO *b;
+        for (b = rbio; b != NULL; b = BIO_next(b)) {
+            h = BIO_get_conn_hostname(b);
+            if (h != NULL && h[0] != '\0')
+                break;
+        }
+        snprintf(host, hostlen, "%s", (h != NULL && h[0] != '\0') ? h : "localhost");
     }
 
+    /*
+     * Port: use getpeername() on the underlying socket fd.
+     *
+     * BIO_get_conn_port() only works on BIO_s_connect BIOs.  The s_client app
+     * creates a raw socket and wraps it with BIO_new_socket(), so the BIO chain
+     * type is "socket" and BIO_get_conn_port() returns NULL.  Walking the chain
+     * doesn't help — there is no connect BIO anywhere.  getpeername() on the
+     * socket fd is the reliable cross-platform way to get the remote port.
+     */
+    *port = 443; /* default */
     {
-        const char *port_str = (rbio != NULL) ? BIO_get_conn_port(rbio) : NULL;
-        *port = (port_str != NULL && port_str[0] != '\0') ? atoi(port_str) : 443;
+        int fd = -1;
+        BIO *b;
+        for (b = rbio; b != NULL; b = BIO_next(b)) {
+            if (BIO_get_fd(b, &fd) > 0 && fd >= 0)
+                break;
+            fd = -1;
+        }
+        if (fd >= 0) {
+            union {
+                struct sockaddr sa;
+                struct sockaddr_in sin;
+                struct sockaddr_in6 sin6;
+            } addr;
+            socklen_t addrlen = sizeof(addr);
+            if (getpeername(fd, &addr.sa, &addrlen) == 0) {
+                if (addr.sa.sa_family == AF_INET)
+                    *port = ntohs(addr.sin.sin_port);
+                else if (addr.sa.sa_family == AF_INET6)
+                    *port = ntohs(addr.sin6.sin6_port);
+            }
+        }
     }
 }
 
@@ -432,6 +478,38 @@ static void pqc_cache_load(pqc_ctx_t *pctx)
 }
 
 /* -------------------------------------------------------------------------
+ * Build a colon-separated list of PQC sigalg names for SSL_set1_sigalgs_list.
+ * Walks the SSL_CTX sigalg_lookup_cache; emits names whose scheme value is in
+ * the PQC registry.  Returns 1 if at least one name was written, 0 otherwise.
+ * ---------------------------------------------------------------------- */
+static int pqc_build_sigalgs_list(SSL_CTX *ctx, char *buf, size_t buflen)
+{
+    size_t i;
+    int n = 0;
+    size_t pos = 0;
+
+    if (ctx == NULL || buf == NULL || buflen == 0) return 0;
+    buf[0] = '\0';
+
+    for (i = 0; i < ctx->sigalg_lookup_cache_len; i++) {
+        const SIGALG_LOOKUP *lu = &ctx->sigalg_lookup_cache[i];
+        size_t nlen;
+
+        if (lu->sigalg == 0 || lu->name == NULL) continue;
+        if (pqc_alg_by_scheme(lu->sigalg) == NULL) continue;
+
+        nlen = strlen(lu->name);
+        if (pos + nlen + 2 > buflen) break;  /* +2 for ':' and NUL */
+        if (n > 0) buf[pos++] = ':';
+        memcpy(buf + pos, lu->name, nlen);
+        pos += nlen;
+        buf[pos] = '\0';
+        n++;
+    }
+    return (n > 0) ? 1 : 0;
+}
+
+/* -------------------------------------------------------------------------
  * Extension callbacks
  * ---------------------------------------------------------------------- */
 
@@ -446,7 +524,26 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
     if (pctx == NULL) return 0;
 
     if (context & SSL_EXT_CLIENT_HELLO) {
+        char host[256];
+        int port = 0;
+        time_t cached_expiry = 0;
+
         if (SSL_is_server(s)) return 0;
+
+        /*
+         * Cache hit: restrict this connection to PQC signature algorithms only.
+         * This is the core downgrade-prevention mechanism — the client will not
+         * offer traditional sigalgs to a server it has previously seen with a
+         * PQC certificate.
+         */
+        pqc_get_host_port(s, host, sizeof(host), &port);
+        if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+            char sigalgs[512];
+            if (pqc_build_sigalgs_list(SSL_get_SSL_CTX(s), sigalgs,
+                                       sizeof(sigalgs)))
+                SSL_set1_sigalgs_list(s, sigalgs);
+        }
+
         *out = NULL; *outlen = 0;
         return 1;
     }
@@ -556,7 +653,7 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
                 pqc_cache_delete(pctx, host, port);
             else
                 pqc_cache_update(pctx, host, port,
-                                 (long)time(NULL) + (long)validity);
+                                 time(NULL) + (time_t)validity);
         }
     }
 

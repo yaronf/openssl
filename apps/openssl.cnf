@@ -388,3 +388,9 @@ oldcert = $insta::certout # insta.cert.pem
 # Certificate revocation
 cmd = rr
 oldcert = $insta::certout # insta.cert.pem
+
+[pqc_continuity]
+# PQC Continuity extension (draft-sheffer-tls-pqc-continuity)
+Enable = yes
+ValidityPeriod = 31536000
+CachePath = $ENV::PQC_CONT/pqc_continuity_cache.pem
