@@ -123,6 +123,7 @@ typedef struct {
     int              port;
     time_t           expiry;       /* only valid for PQC_PENDING_UPDATE */
     int              client_sent_ch; /* server-side: 1 if client included CH ext */
+    int (*prev_verify_cb)(int, X509_STORE_CTX *); /* chained verify callback */
 } pqc_conn_t;
 
 /* SSL ex_data index for pqc_conn_t; initialised once in pqc_cont_init(). */
@@ -583,6 +584,53 @@ static pqc_conn_t *pqc_conn_get_or_create(SSL *s, pqc_ctx_t *pctx)
 }
 
 /* -------------------------------------------------------------------------
+ * Verify callback — fires for each cert during ssl_verify_cert_chain().
+ *
+ * If the EE cert carried a PQC extension (pending op is set), we require
+ * every cert in the chain to be PQC.  A non-PQC cert in the chain while
+ * the EE is PQC indicates a mixed chain — possible CRQC attack on an
+ * intermediate CA.  We abort by returning 0 (verification failure).
+ *
+ * Chains the previous per-SSL verify callback if one was installed.
+ * ---------------------------------------------------------------------- */
+
+static int pqc_verify_cb(int preverify_ok, X509_STORE_CTX *ctx)
+{
+    SSL *ssl;
+    pqc_conn_t *conn;
+    X509 *cert;
+    EVP_PKEY *pkey;
+
+    /* Run the previous verify callback first (if any). */
+    ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
+    if (ssl != NULL && pqc_conn_ex_idx >= 0) {
+        conn = SSL_get_ex_data(ssl, pqc_conn_ex_idx);
+        if (conn != NULL && conn->prev_verify_cb != NULL) {
+            preverify_ok = conn->prev_verify_cb(preverify_ok, ctx);
+        }
+    }
+
+    if (!preverify_ok) return 0;  /* already failing; don't pile on */
+    if (ssl == NULL || pqc_conn_ex_idx < 0) return preverify_ok;
+
+    conn = SSL_get_ex_data(ssl, pqc_conn_ex_idx);
+    if (conn == NULL || conn->op == PQC_PENDING_NONE) return preverify_ok;
+
+    /* Mixed-chain check: current cert must be PQC. */
+    cert = X509_STORE_CTX_get_current_cert(ctx);
+    pkey = cert ? X509_get0_pubkey(cert) : NULL;
+    if (pqc_pkey_to_scheme(SSL_get_SSL_CTX(ssl), pkey) == 0) {
+        char subj[256] = "(unknown)";
+        if (cert)
+            X509_NAME_oneline(X509_get_subject_name(cert), subj, sizeof(subj));
+        fprintf(stderr, "pqc_continuity: mixed chain: non-PQC cert \"%s\" — aborting\n", subj);
+        X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REJECTED);
+        return 0;
+    }
+    return preverify_ok;
+}
+
+/* -------------------------------------------------------------------------
  * Info callback — fires at SSL_CB_HANDSHAKE_DONE.
  * Flushes the pending cache intent only if cert verification succeeded.
  * Chains the CTX-level info callback so apps using -state/-msg still work.
@@ -671,6 +719,19 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
          * so apps using -state/-msg continue to work.
          */
         SSL_set_info_callback(s, pqc_info_cb);
+
+        /*
+         * Install per-SSL verify callback for mixed-chain detection.
+         * Chains the existing per-SSL verify callback (if any).
+         * pqc_verify_cb is a no-op until parse_cb sets op != PQC_PENDING_NONE.
+         */
+        {
+            pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
+            if (conn != NULL) {
+                conn->prev_verify_cb = SSL_get_verify_callback(s);
+                SSL_set_verify(s, SSL_get_verify_mode(s), pqc_verify_cb);
+            }
+        }
 
         pqc_get_host_port(s, host, sizeof(host), &port);
         fprintf(stderr, "pqc_continuity: CH add_cb host=%s port=%d ncache=%d\n",
@@ -887,14 +948,22 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
         if (inlen == 0) {
             /*
              * Empty extension: server signals PQC support but sends no cache
-             * instruction.  If we have a cache entry for this host:port and
-             * the server sent no PQC cert, that is a downgrade — abort.
+             * instruction (traditional cert).  Two checks on the client side:
+             *
+             * 1. Downgrade: if we have a cache entry for this host:port the
+             *    server previously had a PQC cert — abort.
+             *
+             * 2. Mixed chain: if the client has a cache entry and the server
+             *    is sending a traditional cert with a non-PQC chain, that is
+             *    also a downgrade — abort.  (The chain check for the non-empty
+             *    case is below; this handles the cached-sender path.)
              */
-            time_t cached_expiry = 0;
-            if (!SSL_is_server(s)
-                    && pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
-                *al = SSL_AD_HANDSHAKE_FAILURE;
-                return 0; /* downgrade detected */
+            if (!SSL_is_server(s)) {
+                time_t cached_expiry = 0;
+                if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+                    *al = SSL_AD_HANDSHAKE_FAILURE;
+                    return 0; /* downgrade detected */
+                }
             }
             return 1;
         }
