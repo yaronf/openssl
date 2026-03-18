@@ -667,19 +667,15 @@ static int pqc_verify_cb(int preverify_ok, X509_STORE_CTX *ctx)
     X509 *cert;
     EVP_PKEY *pkey;
 
-    /* Run the previous verify callback first (if any). */
     ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
-    if (ssl != NULL && pqc_conn_ex_idx >= 0) {
-        conn = SSL_get_ex_data(ssl, pqc_conn_ex_idx);
-        if (conn != NULL && conn->prev_verify_cb != NULL) {
-            preverify_ok = conn->prev_verify_cb(preverify_ok, ctx);
-        }
-    }
+    conn = (ssl != NULL && pqc_conn_ex_idx >= 0)
+           ? SSL_get_ex_data(ssl, pqc_conn_ex_idx) : NULL;
+
+    /* Run the previous verify callback first (if any). */
+    if (conn != NULL && conn->prev_verify_cb != NULL)
+        preverify_ok = conn->prev_verify_cb(preverify_ok, ctx);
 
     if (!preverify_ok) return 0;  /* already failing; don't pile on */
-    if (ssl == NULL || pqc_conn_ex_idx < 0) return preverify_ok;
-
-    conn = SSL_get_ex_data(ssl, pqc_conn_ex_idx);
     if (conn == NULL || conn->op == PQC_PENDING_NONE) return preverify_ok;
 
     /* Mixed-chain check: current cert must be PQC. */
@@ -748,8 +744,154 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
 }
 
 /* -------------------------------------------------------------------------
+ * Extension wire helpers
+ * ---------------------------------------------------------------------- */
+
+/*
+ * Allocate and fill a 6-byte CT extension buffer: uint16 scheme + uint32 validity.
+ * Sets *out/*outlen on success; sets *al = SSL_AD_INTERNAL_ERROR and returns 0 on
+ * alloc failure.  Returns 1 on success.
+ */
+static int pqc_encode_ct_ext(uint16_t scheme, uint32_t validity,
+                              int *al,
+                              const unsigned char **out, size_t *outlen)
+{
+    unsigned char *buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
+    if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return 0; }
+    buf[0] = (scheme >> 8) & 0xff;
+    buf[1] =  scheme       & 0xff;
+    buf[2] = (validity >> 24) & 0xff;
+    buf[3] = (validity >> 16) & 0xff;
+    buf[4] = (validity >>  8) & 0xff;
+    buf[5] =  validity        & 0xff;
+    *out = buf; *outlen = PQC_EXT_DATA_LEN;
+    return 1;
+}
+
+/* -------------------------------------------------------------------------
  * Extension callbacks
  * ---------------------------------------------------------------------- */
+
+/* --- CH add: client installs callbacks and restricts sigalgs on cache hit --- */
+static int pqc_add_ch(SSL *s, pqc_ctx_t *pctx,
+                      const unsigned char **out, size_t *outlen)
+{
+    char host[256];
+    int port = 0;
+    time_t cached_expiry = 0;
+    pqc_conn_t *conn;
+
+    if (SSL_is_server(s)) return 0;
+
+    /* Install info callback (chains CTX-level) and verify callback (mixed-chain). */
+    SSL_set_info_callback(s, pqc_info_cb);
+    conn = pqc_conn_get_or_create(s, pctx);
+    if (conn != NULL) {
+        conn->prev_verify_cb = SSL_get_verify_callback(s);
+        SSL_set_verify(s, SSL_get_verify_mode(s), pqc_verify_cb);
+    }
+
+    /*
+     * Cache hit: restrict to PQC-only sigalgs — core downgrade prevention.
+     * Client won't offer traditional sigalgs to a previously-PQC server.
+     */
+    pqc_get_host_port(s, host, sizeof(host), &port);
+    if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+        char sigalgs[512];
+        SSL_CTX *sctx = SSL_get_SSL_CTX(s);
+        if (pqc_build_sigalgs_list(sctx, sigalgs, sizeof(sigalgs))) {
+            if (pctx->debug_mask != 0)
+                fprintf(stderr, "pqc_continuity: cache hit %s:%d, restricting sigalgs to: %s\n",
+                        host, port, sigalgs);
+            SSL_set1_sigalgs_list(s, sigalgs);
+        } else if (pctx->debug_mask != 0) {
+            fprintf(stderr, "pqc_continuity: cache hit %s:%d but no PQC sigalgs in lookup cache\n",
+                    host, port);
+        }
+    }
+
+    *out = NULL; *outlen = 0;
+    return 1;
+}
+
+/* --- CT add: server encodes scheme + validity (with debug fault injection) --- */
+static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
+                      X509 *x, size_t chainidx,
+                      int *al,
+                      const unsigned char **out, size_t *outlen)
+{
+    EVP_PKEY *pkey;
+    uint16_t scheme;
+
+    /* Debug chainidx routing: normal path allows EE (chainidx 0) only.
+     * CT_ONLY_INTERMEDIATE (A4b): send on chainidx 1, skip 0.
+     * CT_ON_INTERMEDIATE (A4a): send on both 0 and 1. */
+    if (pctx->debug_mask & PQC_DEBUG_CT_ONLY_INTERMEDIATE) {
+        if (chainidx != 1) return 0;
+        fprintf(stderr, "pqc_continuity: [debug] CT_ONLY_INTERMEDIATE — sending CT on chainidx 1 only\n");
+    } else if (pctx->debug_mask & PQC_DEBUG_CT_ON_INTERMEDIATE) {
+        if (chainidx > 1) return 0;
+        if (chainidx == 1)
+            fprintf(stderr, "pqc_continuity: [debug] CT_ON_INTERMEDIATE — also sending CT on chainidx 1\n");
+    } else if (chainidx != 0) {
+        return 0;
+    }
+
+    /* Server: only send CT if client included the CH extension (P1). */
+    if (SSL_is_server(s)) {
+        pqc_conn_t *conn = (pqc_conn_ex_idx >= 0)
+                           ? SSL_get_ex_data(s, pqc_conn_ex_idx) : NULL;
+        if (conn == NULL || !conn->client_sent_ch) {
+            if (pctx->debug_mask != 0)
+                fprintf(stderr, "pqc_continuity: server skipping CT — client did not send CH\n");
+            return 0;
+        }
+    }
+
+    pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
+    scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
+    if (scheme == 0) {
+        /* Traditional cert: empty extension signals presence only. */
+        *out = NULL; *outlen = 0;
+        return 1;
+    }
+
+    /* Debug fault injection — wrong/legacy/unknown scheme or malformed length. */
+    if (pctx->debug_mask & PQC_DEBUG_WRONG_SCHEME) {
+        uint16_t wrong;
+        fprintf(stderr, "pqc_continuity: [debug] WRONG_SCHEME — sending mismatched scheme\n");
+        if      (scheme == PQC_MLDSA44) wrong = PQC_MLDSA65;
+        else if (scheme == PQC_MLDSA65) wrong = PQC_MLDSA87;
+        else                             wrong = PQC_MLDSA44;
+        return pqc_encode_ct_ext(wrong, pctx->validity_period, al, out, outlen);
+    }
+    if (pctx->debug_mask & PQC_DEBUG_LEGACY_SCHEME) {
+        fprintf(stderr, "pqc_continuity: [debug] LEGACY_SCHEME — sending RSA scheme 0x0401\n");
+        return pqc_encode_ct_ext(0x0401, pctx->validity_period, al, out, outlen);
+    }
+    if (pctx->debug_mask & PQC_DEBUG_MALFORMED_EXT) {
+        unsigned char *buf;
+        fprintf(stderr, "pqc_continuity: [debug] MALFORMED_EXT — sending 3-byte extension\n");
+        buf = OPENSSL_malloc(3);
+        if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
+        buf[0] = (scheme >> 8) & 0xff;
+        buf[1] =  scheme       & 0xff;
+        buf[2] = 0x42;
+        *out = buf; *outlen = 3;
+        return 1;
+    }
+    if (pctx->debug_mask & PQC_DEBUG_UNKNOWN_SCHEME) {
+        fprintf(stderr, "pqc_continuity: [debug] UNKNOWN_SCHEME — sending scheme 0xFE42\n");
+        return pqc_encode_ct_ext(0xFE42, pctx->validity_period, al, out, outlen);
+    }
+
+    /*
+     * Normal path: PQC cert.  validity=0 instructs the client to clear its
+     * cache; must send full extension (not empty) to distinguish from a
+     * traditional-cert presence signal.
+     */
+    return pqc_encode_ct_ext(scheme, pctx->validity_period, al, out, outlen);
+}
 
 static int pqc_add_cb(SSL *s, unsigned int ext_type,
                        unsigned int context,
@@ -758,61 +900,10 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
                        int *al, void *add_arg)
 {
     pqc_ctx_t *pctx = (pqc_ctx_t *)add_arg;
-
     if (pctx == NULL) return 0;
 
-    if (context & SSL_EXT_CLIENT_HELLO) {
-        char host[256];
-        int port = 0;
-        time_t cached_expiry = 0;
-
-        if (SSL_is_server(s)) return 0;
-
-
-        /*
-         * Cache hit: restrict this connection to PQC signature algorithms only.
-         * This is the core downgrade-prevention mechanism — the client will not
-         * offer traditional sigalgs to a server it has previously seen with a
-         * PQC certificate.
-         */
-        /*
-         * Install our per-SSL info callback now, before any app callback is
-         * set on this SSL object.  pqc_info_cb chains the CTX-level callback
-         * so apps using -state/-msg continue to work.
-         */
-        SSL_set_info_callback(s, pqc_info_cb);
-
-        /*
-         * Install per-SSL verify callback for mixed-chain detection.
-         * Chains the existing per-SSL verify callback (if any).
-         * pqc_verify_cb is a no-op until parse_cb sets op != PQC_PENDING_NONE.
-         */
-        {
-            pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
-            if (conn != NULL) {
-                conn->prev_verify_cb = SSL_get_verify_callback(s);
-                SSL_set_verify(s, SSL_get_verify_mode(s), pqc_verify_cb);
-            }
-        }
-
-        pqc_get_host_port(s, host, sizeof(host), &port);
-        if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
-            char sigalgs[512];
-            SSL_CTX *sctx = SSL_get_SSL_CTX(s);
-            if (pqc_build_sigalgs_list(sctx, sigalgs, sizeof(sigalgs))) {
-                if (pctx->debug_mask != 0)
-                    fprintf(stderr, "pqc_continuity: cache hit %s:%d, restricting sigalgs to: %s\n",
-                            host, port, sigalgs);
-                SSL_set1_sigalgs_list(s, sigalgs);
-            } else if (pctx->debug_mask != 0) {
-                fprintf(stderr, "pqc_continuity: cache hit %s:%d but no PQC sigalgs in lookup cache\n",
-                        host, port);
-            }
-        }
-
-        *out = NULL; *outlen = 0;
-        return 1;
-    }
+    if (context & SSL_EXT_CLIENT_HELLO)
+        return pqc_add_ch(s, pctx, out, outlen);
 
     if (context & SSL_EXT_TLS1_3_CERTIFICATE_REQUEST) {
         if (!SSL_is_server(s)) return 0;
@@ -820,145 +911,8 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
         return 1;
     }
 
-    if (context & SSL_EXT_TLS1_3_CERTIFICATE) {
-        EVP_PKEY *pkey;
-        uint16_t scheme;
-        unsigned char *buf;
-
-        /* Debug: CT_ON_INTERMEDIATE — also inject CT on chainidx 1 (in addition to
-         * the normal chainidx 0 extension).  This gives two separate test scenarios:
-         *   A4a: extension on both EE (0) and intermediate (1) — client sees it on 0
-         *        first, processes it, then receives it again on 1 → illegal_parameter.
-         *   A4b: extension on chainidx 1 only (use CT_ON_INTERMEDIATE without this
-         *        flag and skip chainidx 0 via the else branch) — tested separately.
-         * The flag allows 0 and 1; the normal path only allows 0. */
-        if (pctx->debug_mask & PQC_DEBUG_CT_ONLY_INTERMEDIATE) {
-            /* Send CT on chainidx 1 only — EE gets no extension. */
-            if (chainidx != 1) return 0;
-            fprintf(stderr, "pqc_continuity: [debug] CT_ONLY_INTERMEDIATE — sending CT on chainidx 1 only\n");
-        } else if (pctx->debug_mask & PQC_DEBUG_CT_ON_INTERMEDIATE) {
-            /* Send CT on both chainidx 0 (normal) and chainidx 1 (injected). */
-            if (chainidx > 1) return 0;
-            if (chainidx == 1)
-                fprintf(stderr, "pqc_continuity: [debug] CT_ON_INTERMEDIATE — also sending CT on chainidx 1\n");
-        } else if (chainidx != 0) {
-            return 0;
-        }
-
-        /*
-         * Server: only send CT if client included the CH extension (P1).
-         * If client did not send CH, server must not send CT.
-         */
-        if (SSL_is_server(s)) {
-            pqc_conn_t *conn = (pqc_conn_ex_idx >= 0)
-                               ? SSL_get_ex_data(s, pqc_conn_ex_idx) : NULL;
-            if (conn == NULL || !conn->client_sent_ch) {
-                if (pctx->debug_mask != 0)
-                    fprintf(stderr, "pqc_continuity: server skipping CT — client did not send CH\n");
-                return 0;
-            }
-        }
-
-        pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
-        scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
-        if (scheme == 0) {
-            /*
-             * Traditional cert: send empty extension as a presence signal only.
-             * The client's parse_cb will check for a downgrade if it has a
-             * cache entry for this host:port.
-             */
-            *out = NULL; *outlen = 0;
-            return 1;
-        }
-
-        /* Debug: WRONG_SCHEME — send a different known PQC scheme.
-         * Pick the next ML-DSA level (wraps within the ML-DSA range). */
-        if (pctx->debug_mask & PQC_DEBUG_WRONG_SCHEME) {
-            uint16_t wrong;
-            fprintf(stderr, "pqc_continuity: [debug] WRONG_SCHEME — sending mismatched scheme\n");
-            /* Cycle within ML-DSA: 44→65→87→44 */
-            if      (scheme == PQC_MLDSA44) wrong = PQC_MLDSA65;
-            else if (scheme == PQC_MLDSA65) wrong = PQC_MLDSA87;
-            else                             wrong = PQC_MLDSA44;
-            buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
-            if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-            buf[0] = (wrong >> 8) & 0xff;
-            buf[1] =  wrong       & 0xff;
-            buf[2] = (pctx->validity_period >> 24) & 0xff;
-            buf[3] = (pctx->validity_period >> 16) & 0xff;
-            buf[4] = (pctx->validity_period >>  8) & 0xff;
-            buf[5] =  pctx->validity_period        & 0xff;
-            *out = buf; *outlen = PQC_EXT_DATA_LEN;
-            return 1;
-        }
-
-        /* Debug: LEGACY_SCHEME — send rsa_pkcs1_sha256 (0x0401) in the extension. */
-        if (pctx->debug_mask & PQC_DEBUG_LEGACY_SCHEME) {
-            fprintf(stderr, "pqc_continuity: [debug] LEGACY_SCHEME — sending RSA scheme 0x0401\n");
-            buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
-            if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-            buf[0] = 0x04; buf[1] = 0x01;  /* rsa_pkcs1_sha256 */
-            buf[2] = (pctx->validity_period >> 24) & 0xff;
-            buf[3] = (pctx->validity_period >> 16) & 0xff;
-            buf[4] = (pctx->validity_period >>  8) & 0xff;
-            buf[5] =  pctx->validity_period        & 0xff;
-            *out = buf; *outlen = PQC_EXT_DATA_LEN;
-            return 1;
-        }
-
-        /* Debug: MALFORMED_EXT — send extension with wrong length (3 bytes). */
-        if (pctx->debug_mask & PQC_DEBUG_MALFORMED_EXT) {
-            fprintf(stderr, "pqc_continuity: [debug] MALFORMED_EXT — sending 3-byte extension\n");
-            buf = OPENSSL_malloc(3);
-            if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-            buf[0] = (scheme >> 8) & 0xff;
-            buf[1] =  scheme       & 0xff;
-            buf[2] = 0x42;  /* truncated — not a valid 6-byte extension */
-            *out = buf; *outlen = 3;
-            return 1;
-        }
-
-        /* Debug: UNKNOWN_SCHEME — send an unregistered scheme value. */
-        if (pctx->debug_mask & PQC_DEBUG_UNKNOWN_SCHEME) {
-            fprintf(stderr, "pqc_continuity: [debug] UNKNOWN_SCHEME — sending scheme 0xFE42\n");
-            buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
-            if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-            buf[0] = 0xFE; buf[1] = 0x42;  /* not in pqc_alg_registry */
-            buf[2] = (pctx->validity_period >> 24) & 0xff;
-            buf[3] = (pctx->validity_period >> 16) & 0xff;
-            buf[4] = (pctx->validity_period >>  8) & 0xff;
-            buf[5] =  pctx->validity_period        & 0xff;
-            *out = buf; *outlen = PQC_EXT_DATA_LEN;
-            return 1;
-        }
-
-        if (pctx->validity_period == 0) {
-            /*
-             * PQC cert + ValidityPeriod = 0: explicitly instruct the client to
-             * clear its cache entry for this host:port.  Send the full extension
-             * with validity = 0; an empty extension would be misread as a
-             * traditional-cert downgrade by a client that has a cache entry.
-             */
-            buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
-            if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-            buf[0] = (scheme >> 8) & 0xff;
-            buf[1] =  scheme       & 0xff;
-            buf[2] = buf[3] = buf[4] = buf[5] = 0;   /* validity = 0 */
-            *out = buf; *outlen = PQC_EXT_DATA_LEN;
-            return 1;
-        }
-
-        buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
-        if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-        buf[0] = (scheme >> 8) & 0xff;
-        buf[1] =  scheme       & 0xff;
-        buf[2] = (pctx->validity_period >> 24) & 0xff;
-        buf[3] = (pctx->validity_period >> 16) & 0xff;
-        buf[4] = (pctx->validity_period >>  8) & 0xff;
-        buf[5] =  pctx->validity_period        & 0xff;
-        *out = buf; *outlen = PQC_EXT_DATA_LEN;
-        return 1;
-    }
+    if (context & SSL_EXT_TLS1_3_CERTIFICATE)
+        return pqc_add_ct(s, pctx, x, chainidx, al, out, outlen);
 
     return 0;
 }
@@ -971,6 +925,93 @@ static void pqc_free_cb(SSL *s, unsigned int ext_type,
         OPENSSL_free((void *)out);
 }
 
+/* --- CT parse: client validates scheme vs cert, defers cache write --- */
+static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
+                         const unsigned char *in, size_t inlen,
+                         X509 *x, size_t chainidx, int *al)
+{
+    char host[256];
+    int port = 0;
+    uint16_t scheme;
+    uint32_t validity;
+    pqc_conn_t *conn;
+
+    if (chainidx != 0) {
+        /* CT extension on a non-EE CertificateEntry is a protocol violation. */
+        if (!SSL_is_server(s)) {
+            fprintf(stderr, "pqc_continuity: CT extension on chainidx %zu (not EE) — aborting\n",
+                    chainidx);
+            *al = SSL_AD_ILLEGAL_PARAMETER;
+            return 0;
+        }
+        return 1;
+    }
+
+    pqc_get_host_port(s, host, sizeof(host), &port);
+
+    if (inlen == 0) {
+        /*
+         * Empty extension: traditional cert signals PQC support presence only.
+         * If the client has a cache entry, this server previously had a PQC
+         * cert — abort as a downgrade.
+         */
+        if (!SSL_is_server(s)) {
+            time_t cached_expiry = 0;
+            if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+                *al = SSL_AD_HANDSHAKE_FAILURE;
+                return 0; /* downgrade detected */
+            }
+        }
+        return 1;
+    }
+
+    if (inlen != PQC_EXT_DATA_LEN) { *al = SSL_AD_DECODE_ERROR; return 0; }
+
+    scheme   = ((uint16_t)in[0] << 8) | (uint16_t)in[1];
+    validity = ((uint32_t)in[2] << 24) | ((uint32_t)in[3] << 16)
+             | ((uint32_t)in[4] <<  8) |  (uint32_t)in[5];
+
+    /*
+     * The scheme must exactly match the cert's public key.  Any deviation
+     * (wrong PQC alg, legacy alg, unknown value) is treated as tampering.
+     * No forward-compat carve-out: if the server sends this extension it must
+     * be consistent with the cert it is presenting.
+     */
+    if (!SSL_is_server(s)) {
+        EVP_PKEY *pkey = x != NULL ? X509_get0_pubkey(x) : NULL;
+        uint16_t cert_scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
+        if (cert_scheme == 0 || cert_scheme != scheme) {
+            fprintf(stderr, "pqc_continuity: CT parse_cb scheme mismatch: "
+                    "extension=0x%04x cert=0x%04x — aborting\n",
+                    scheme, cert_scheme);
+            *al = SSL_AD_ILLEGAL_PARAMETER;
+            return 0;
+        }
+    }
+
+    /*
+     * Do NOT write the cache here — this fires before ssl_verify_cert_chain().
+     * Record the intent; pqc_info_cb() flushes it at SSL_CB_HANDSHAKE_DONE
+     * after confirming X509_V_OK.
+     */
+    conn = pqc_conn_get_or_create(s, pctx);
+    if (conn != NULL) {
+        snprintf(conn->host, sizeof(conn->host), "%s", host);
+        conn->port = port;
+        if (validity == 0) {
+            conn->op = PQC_PENDING_DELETE;
+        } else {
+            conn->op     = PQC_PENDING_UPDATE;
+            conn->expiry = time(NULL) + (time_t)validity;
+        }
+        if (pctx->debug_mask != 0)
+            fprintf(stderr, "pqc_continuity: CT parse_cb deferring cache %s for %s:%d\n",
+                    validity == 0 ? "delete" : "update", host, port);
+    }
+
+    return 1;
+}
+
 static int pqc_parse_cb(SSL *s, unsigned int ext_type,
                           unsigned int context,
                           const unsigned char *in, size_t inlen,
@@ -978,16 +1019,14 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
                           int *al, void *parse_arg)
 {
     pqc_ctx_t *pctx = (pqc_ctx_t *)parse_arg;
+    pqc_conn_t *conn;
 
     if (pctx == NULL) return 1;
 
     if (context & SSL_EXT_CLIENT_HELLO) {
-        /*
-         * Server notes that client supports the extension.
-         * Store in per-connection state so CT add_cb can gate on it.
-         */
+        /* Server notes that client supports the extension. */
         if (SSL_is_server(s)) {
-            pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
+            conn = pqc_conn_get_or_create(s, pctx);
             if (conn != NULL)
                 conn->client_sent_ch = 1;
         }
@@ -996,104 +1035,15 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
 
     if (context & SSL_EXT_TLS1_3_CERTIFICATE_REQUEST) {
         if (!SSL_is_server(s)) {
-            pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
+            conn = pqc_conn_get_or_create(s, pctx);
             if (conn != NULL)
                 conn->server_sent_cr = 1;
         }
         return 1;
     }
 
-    if (context & SSL_EXT_TLS1_3_CERTIFICATE) {
-        char host[256];
-        int port = 0;
-
-        if (chainidx != 0) {
-            /* CT extension on a non-EE CertificateEntry is a protocol violation. */
-            if (!SSL_is_server(s)) {
-                fprintf(stderr, "pqc_continuity: CT extension on chainidx %zu (not EE) — aborting\n",
-                        chainidx);
-                *al = SSL_AD_ILLEGAL_PARAMETER;
-                return 0;
-            }
-            return 1;
-        }
-
-        pqc_get_host_port(s, host, sizeof(host), &port);
-
-        if (inlen == 0) {
-            /*
-             * Empty extension: server signals PQC support but sends no cache
-             * instruction (traditional cert).  Two checks on the client side:
-             *
-             * 1. Downgrade: if we have a cache entry for this host:port the
-             *    server previously had a PQC cert — abort.
-             *
-             * 2. Mixed chain: if the client has a cache entry and the server
-             *    is sending a traditional cert with a non-PQC chain, that is
-             *    also a downgrade — abort.  (The chain check for the non-empty
-             *    case is below; this handles the cached-sender path.)
-             */
-            if (!SSL_is_server(s)) {
-                time_t cached_expiry = 0;
-                if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
-                    *al = SSL_AD_HANDSHAKE_FAILURE;
-                    return 0; /* downgrade detected */
-                }
-            }
-            return 1;
-        }
-
-        if (inlen != PQC_EXT_DATA_LEN) { *al = SSL_AD_DECODE_ERROR; return 0; }
-
-        {
-            uint16_t scheme   = ((uint16_t)in[0] << 8) | (uint16_t)in[1];
-            uint32_t validity = ((uint32_t)in[2] << 24) | ((uint32_t)in[3] << 16)
-                              | ((uint32_t)in[4] <<  8) |  (uint32_t)in[5];
-
-            /*
-             * The scheme in the extension must exactly match the cert's actual
-             * public key.  Any deviation — wrong PQC alg, legacy alg, or
-             * unknown value — is treated as tampering: abort with
-             * illegal_parameter.  There is no forward-compat carve-out for
-             * unknown schemes; if the server sends an extension it must be
-             * consistent with the cert it is presenting.
-             */
-            if (!SSL_is_server(s)) {
-                EVP_PKEY *pkey = x != NULL ? X509_get0_pubkey(x) : NULL;
-                uint16_t cert_scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
-                if (cert_scheme == 0 || cert_scheme != scheme) {
-                    fprintf(stderr, "pqc_continuity: CT parse_cb scheme mismatch: "
-                            "extension=0x%04x cert=0x%04x — aborting\n",
-                            scheme, cert_scheme);
-                    *al = SSL_AD_ILLEGAL_PARAMETER;
-                    return 0;
-                }
-            }
-
-            /*
-             * Do NOT write the cache here.  This callback fires before
-             * ssl_verify_cert_chain() — the peer's cert is not yet verified.
-             * Record the intent; pqc_info_cb() flushes it at
-             * SSL_CB_HANDSHAKE_DONE after confirming X509_V_OK.
-             */
-            {
-                pqc_conn_t *conn = pqc_conn_get_or_create(s, pctx);
-                if (conn != NULL) {
-                    snprintf(conn->host, sizeof(conn->host), "%s", host);
-                    conn->port = port;
-                    if (validity == 0) {
-                        conn->op = PQC_PENDING_DELETE;
-                    } else {
-                        conn->op     = PQC_PENDING_UPDATE;
-                        conn->expiry = time(NULL) + (time_t)validity;
-                    }
-                    if (pctx->debug_mask != 0)
-                        fprintf(stderr, "pqc_continuity: CT parse_cb deferring cache %s for %s:%d\n",
-                                validity == 0 ? "delete" : "update", host, port);
-                }
-            }
-        }
-    }
+    if (context & SSL_EXT_TLS1_3_CERTIFICATE)
+        return pqc_parse_ct(s, pctx, in, inlen, x, chainidx, al);
 
     return 1;
 }
@@ -1102,10 +1052,73 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
  * Public API
  * ---------------------------------------------------------------------- */
 
+/*
+ * Load [pqc_continuity] section from $OPENSSL_CONF into pctx.
+ * Returns  1  if section found and not explicitly disabled.
+ * Returns  0  if section absent (silently disabled).
+ * Returns -1  if Enable = no (explicitly disabled).
+ */
+static int pqc_ctx_load_config(pqc_ctx_t *pctx)
+{
+    CONF *conf = NULL;
+    long eline = 0;
+    int section_found = 0;
+    const char *conffile = getenv("OPENSSL_CONF");
+    if (conffile == NULL) conffile = getenv("SSLEAY_CONF");
+    if (conffile == NULL) return 0;
+
+    conf = NCONF_new(NULL);
+    if (conf == NULL) return 0;
+    if (NCONF_load(conf, conffile, &eline) <= 0) {
+        NCONF_free(conf);
+        ERR_clear_error();
+        return 0;
+    }
+
+    {
+        char *val;
+
+        val = NCONF_get_string(conf, "pqc_continuity", "Enable");
+        if (val != NULL) {
+            section_found = 1;
+            if (strcasecmp(val, "no") == 0) {
+                NCONF_free(conf);
+                return -1; /* explicitly disabled */
+            }
+        } else { ERR_clear_error(); }
+
+        val = NCONF_get_string(conf, "pqc_continuity", "ValidityPeriod");
+        if (val != NULL) {
+            section_found = 1;
+            pctx->validity_period = (uint32_t)strtoul(val, NULL, 10);
+        } else { ERR_clear_error(); }
+
+        val = NCONF_get_string(conf, "pqc_continuity", "CachePath");
+        if (val != NULL) {
+            section_found = 1;
+            snprintf(pctx->cache_path, sizeof(pctx->cache_path), "%s", val);
+            pctx->cache_enabled = 1;
+        } else { ERR_clear_error(); }
+
+        val = NCONF_get_string(conf, "pqc_continuity", "Debug");
+        if (val != NULL) {
+            section_found = 1;
+            pctx->debug_mask = (uint32_t)strtoul(val, NULL, 16);
+            if (pctx->debug_mask != 0)
+                fprintf(stderr, "pqc_continuity: debug_mask=0x%02x (fault injection active)\n",
+                        pctx->debug_mask);
+        } else { ERR_clear_error(); }
+    }
+
+    NCONF_free(conf);
+    ERR_clear_error();
+    return section_found ? 1 : 0;
+}
+
 int pqc_cont_init(SSL_CTX *ctx)
 {
     pqc_ctx_t *pctx;
-    int section_found = 0;
+    int cfg;
     unsigned int contexts;
 
     /* Register SSL ex_data slot exactly once, thread-safely. */
@@ -1115,69 +1128,12 @@ int pqc_cont_init(SSL_CTX *ctx)
     pctx = OPENSSL_zalloc(sizeof(*pctx));
     if (pctx == NULL) return 0;
 
-    /* validity_period stays 0 until set by ValidityPeriod in config */
-
-    /* Read [pqc_continuity] from $OPENSSL_CONF; no-op if section absent. */
-    {
-        CONF *conf = NULL;
-        long eline = 0;
-        const char *conffile = getenv("OPENSSL_CONF");
-        if (conffile == NULL) conffile = getenv("SSLEAY_CONF");
-        if (conffile != NULL) {
-            conf = NCONF_new(NULL);
-            if (conf != NULL && NCONF_load(conf, conffile, &eline) > 0) {
-                char *val;
-
-                val = NCONF_get_string(conf, "pqc_continuity", "Enable");
-                if (val != NULL) {
-                    section_found = 1;
-                    if (strcasecmp(val, "no") == 0) {
-                        NCONF_free(conf);
-                        OPENSSL_free(pctx->cache);
-                        OPENSSL_free(pctx);
-                        return 1; /* explicitly disabled: do not register extension */
-                    }
-                } else {
-                    ERR_clear_error();
-                }
-
-                val = NCONF_get_string(conf, "pqc_continuity", "ValidityPeriod");
-                if (val != NULL) {
-                    section_found = 1;
-                    pctx->validity_period = (uint32_t)strtoul(val, NULL, 10);
-                } else {
-                    ERR_clear_error();
-                }
-
-                val = NCONF_get_string(conf, "pqc_continuity", "CachePath");
-                if (val != NULL) {
-                    section_found = 1;
-                    snprintf(pctx->cache_path, sizeof(pctx->cache_path), "%s", val);
-                    pctx->cache_enabled = 1;
-                } else {
-                    ERR_clear_error();
-                }
-
-                val = NCONF_get_string(conf, "pqc_continuity", "Debug");
-                if (val != NULL) {
-                    section_found = 1;
-                    pctx->debug_mask = (uint32_t)strtoul(val, NULL, 16);
-                    if (pctx->debug_mask != 0)
-                        fprintf(stderr, "pqc_continuity: debug_mask=0x%02x (fault injection active)\n",
-                                pctx->debug_mask);
-                } else {
-                    ERR_clear_error();
-                }
-            }
-            NCONF_free(conf);
-            ERR_clear_error();
-        }
-    }
-
-    if (!section_found) {
+    cfg = pqc_ctx_load_config(pctx);
+    if (cfg <= 0) {
+        /* 0 = no section (silently disabled), -1 = explicitly disabled */
         OPENSSL_free(pctx->cache);
         OPENSSL_free(pctx);
-        return 1; /* no config section: silently disabled */
+        return 1;
     }
 
     pqc_cache_load(pctx);
