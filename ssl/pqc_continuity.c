@@ -537,11 +537,30 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
          * PQC certificate.
          */
         pqc_get_host_port(s, host, sizeof(host), &port);
+        fprintf(stderr, "pqc_continuity: CH add_cb host=%s port=%d ncache=%d\n",
+                host, port, pctx->ncache);
         if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
             char sigalgs[512];
-            if (pqc_build_sigalgs_list(SSL_get_SSL_CTX(s), sigalgs,
-                                       sizeof(sigalgs)))
+            SSL_CTX *sctx = SSL_get_SSL_CTX(s);
+            fprintf(stderr, "pqc_continuity: cache hit for %s:%d expiry=%ld, building sigalgs list (cache_len=%zu)\n",
+                    host, port, (long)cached_expiry, sctx->sigalg_lookup_cache_len);
+            if (pqc_build_sigalgs_list(sctx, sigalgs, sizeof(sigalgs))) {
+                fprintf(stderr, "pqc_continuity: restricting sigalgs to: %s\n", sigalgs);
                 SSL_set1_sigalgs_list(s, sigalgs);
+            } else {
+                fprintf(stderr, "pqc_continuity: pqc_build_sigalgs_list returned 0 (no PQC sigalgs in lookup cache)\n");
+                /* Dump first few entries to diagnose */
+                {
+                    size_t k;
+                    for (k = 0; k < sctx->sigalg_lookup_cache_len && k < 20; k++) {
+                        const SIGALG_LOOKUP *lu = &sctx->sigalg_lookup_cache[k];
+                        fprintf(stderr, "  sigalg_lookup_cache[%zu]: sigalg=0x%04x name=%s sig=%d\n",
+                                k, lu->sigalg, lu->name ? lu->name : "(null)", lu->sig);
+                    }
+                }
+            }
+        } else {
+            fprintf(stderr, "pqc_continuity: no cache hit for %s:%d\n", host, port);
         }
 
         *out = NULL; *outlen = 0;
@@ -563,14 +582,28 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
 
         pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
         scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
-        if (scheme == 0 || pctx->validity_period == 0) {
+        if (scheme == 0) {
             /*
-             * Traditional cert, or no ValidityPeriod configured: send empty
-             * extension as a presence signal only — no cache instruction.
-             * (validity_period == 0 on the wire means "clear cache", so we
-             * must not send it unless explicitly configured.)
+             * Traditional cert: send empty extension as a presence signal only.
+             * The client's parse_cb will check for a downgrade if it has a
+             * cache entry for this host:port.
              */
             *out = NULL; *outlen = 0;
+            return 1;
+        }
+        if (pctx->validity_period == 0) {
+            /*
+             * PQC cert + ValidityPeriod = 0: explicitly instruct the client to
+             * clear its cache entry for this host:port.  Send the full extension
+             * with validity = 0; an empty extension would be misread as a
+             * traditional-cert downgrade by a client that has a cache entry.
+             */
+            buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
+            if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
+            buf[0] = (scheme >> 8) & 0xff;
+            buf[1] =  scheme       & 0xff;
+            buf[2] = buf[3] = buf[4] = buf[5] = 0;   /* validity = 0 */
+            *out = buf; *outlen = PQC_EXT_DATA_LEN;
             return 1;
         }
 
