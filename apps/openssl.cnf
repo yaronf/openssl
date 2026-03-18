@@ -394,3 +394,4 @@ oldcert = $insta::certout # insta.cert.pem
 Enable = yes
 ValidityPeriod = 31536000
 CachePath = $ENV::PQC_CONT/pqc_continuity_cache.pem
+# Debug = 0x00   # hex bitmask for test fault injection; see docs/POC-PLAN.md § Debug Bitmask
