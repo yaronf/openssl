@@ -29,7 +29,10 @@
 #include <errno.h>
 #ifndef _WIN32
 # include <sys/socket.h>
+# include <sys/file.h>   /* flock */
 # include <netinet/in.h>
+# include <fcntl.h>      /* O_WRONLY, O_CREAT */
+# include <unistd.h>     /* close */
 #else
 # include <winsock2.h>
 # include <ws2tcpip.h>
@@ -88,15 +91,43 @@ typedef struct {
 #define PQC_DEBUG_CT_ON_INTERMEDIATE    0x40  /* server sends CT on both EE (chainidx 0) AND intermediate (chainidx 1) */
 #define PQC_DEBUG_CT_ONLY_INTERMEDIATE  0x80  /* server sends CT on intermediate (chainidx 1) ONLY, skipping EE */
 
-/* Per-context state, passed via add_arg / parse_arg. */
+/*
+ * Per-path global cache.  One instance per unique CachePath value across all
+ * SSL_CTX objects in the process.  In practice always a single instance.
+ * Protected by its own CRYPTO_RWLOCK: read lock for lookup, write lock for
+ * update/delete/persist/load.
+ */
+#define PQC_MAX_CACHES 4
+
 typedef struct {
-    uint32_t     validity_period;
-    char         cache_path[512];
-    int          cache_enabled; /* 1 if CachePath was set; 0 = no persistence */
-    uint32_t     debug_mask;  /* fault injection bitmask; 0 in production */
-    pqc_entry_t *cache;     /* heap-allocated, grown with OPENSSL_realloc */
-    int          ncache;
-    int          cache_cap;
+    char          path[512];
+    int           enabled;
+    pqc_entry_t  *entries;
+    int           nentries;
+    int           cap;
+    CRYPTO_RWLOCK *lock;
+} pqc_gcache_t;
+
+static pqc_gcache_t   pqc_caches[PQC_MAX_CACHES];
+static int            pqc_ncaches    = 0;
+static CRYPTO_RWLOCK *pqc_reg_lock   = NULL; /* protects pqc_caches[] registry */
+static CRYPTO_ONCE    pqc_reg_once   = CRYPTO_ONCE_STATIC_INIT;
+
+DEFINE_RUN_ONCE_STATIC(pqc_reg_init)
+{
+    pqc_reg_lock = CRYPTO_THREAD_lock_new();
+    return (pqc_reg_lock != NULL);
+}
+
+/*
+ * Per-context state, passed via add_arg / parse_arg.
+ * Cache fields have moved to pqc_gcache_t; pctx holds only per-CTX config.
+ * cache_idx is the index into pqc_caches[], or -1 if caching is disabled.
+ */
+typedef struct {
+    uint32_t validity_period;
+    uint32_t debug_mask;  /* fault injection bitmask; 0 in production */
+    int      cache_idx;   /* index into pqc_caches[], or -1 */
 } pqc_ctx_t;
 
 /*
@@ -134,9 +165,10 @@ typedef struct {
 static int         pqc_conn_ex_idx  = -1;
 static CRYPTO_ONCE pqc_ex_idx_once  = CRYPTO_ONCE_STATIC_INIT;
 
-/* Forward declaration — defined below near the ex_data lifecycle section. */
+/* Forward declarations. */
 static void pqc_conn_free(void *parent, void *ptr, CRYPTO_EX_DATA *ad,
                            int idx, long argl, void *argp);
+static pqc_gcache_t *pqc_get_gcache(const pqc_ctx_t *pctx);
 
 DEFINE_RUN_ONCE_STATIC(pqc_ex_idx_init)
 {
@@ -388,71 +420,85 @@ IMPLEMENT_ASN1_FUNCTIONS(PQC_CACHE_ENTRY)
 /* -------------------------------------------------------------------------
  * Cache: in-memory operations + atomic file persistence
  *
- * The in-memory array (pctx->cache[]) is the authoritative state.
- * The file is written atomically (temp + rename) on every change.
- * Multiple processes sharing the same file are not explicitly coordinated
- * beyond the atomic rename; this is sufficient for the POC.
+ * All functions operate on pqc_gcache_t.  Callers are responsible for holding
+ * the appropriate lock (read for lookup, write for mutating operations).
+ * pqc_cache_lookup and pqc_cache_update/delete acquire locks internally so
+ * call sites don't need to.
  * ---------------------------------------------------------------------- */
 
-/* Find index of (host, port) in cache, or -1. Ignores expiry. */
-static int pqc_cache_find(const pqc_ctx_t *pctx, const char *host, int port)
+/* Must be called with gc->lock write-held (or at single-threaded init). */
+static int pqc_gcache_grow(pqc_gcache_t *gc)
+{
+    int newcap = gc->cap == 0 ? PQC_CACHE_INIT : gc->cap * 2;
+    pqc_entry_t *p = OPENSSL_realloc(gc->entries, newcap * sizeof(pqc_entry_t));
+    if (p == NULL) return 0;
+    gc->entries = p;
+    gc->cap = newcap;
+    return 1;
+}
+
+/* Find index of (host, port) in gc, or -1.  Must be called with lock held. */
+static int pqc_gcache_find(const pqc_gcache_t *gc, const char *host, int port)
 {
     int i;
-    for (i = 0; i < pctx->ncache; i++)
-        if (pctx->cache[i].port == port
-                && strcmp(pctx->cache[i].host, host) == 0)
+    for (i = 0; i < gc->nentries; i++)
+        if (gc->entries[i].port == port
+                && strcmp(gc->entries[i].host, host) == 0)
             return i;
     return -1;
 }
 
-/* Lookup: return 1 and set *expiry_out if a valid (unexpired) entry exists. */
-static int pqc_cache_lookup(const pqc_ctx_t *pctx, const char *host, int port,
-                             time_t *expiry_out)
-{
-    int i = pqc_cache_find(pctx, host, port);
-    if (i < 0) return 0;
-    if (pctx->cache[i].expiry <= time(NULL)) return 0;
-    *expiry_out = pctx->cache[i].expiry;
-    return 1;
-}
-
 /*
- * Persist the full in-memory cache to disk atomically (temp + rename).
+ * Persist the full in-memory cache to disk atomically (temp + rename),
+ * protected by a per-path .lock file for cross-process serialization.
+ * Must be called with gc->lock write-held.
  * No-op if cache is not enabled.
  */
-static int pqc_cache_persist(pqc_ctx_t *pctx)
+static int pqc_gcache_persist(pqc_gcache_t *gc)
 {
-    /* Suffix ".tmp.XXXXXX" = 11 chars + NUL; assert we have room. */
-    _Static_assert(sizeof(((pqc_ctx_t *)0)->cache_path) + 12
-                   <= 528, "tmppath too small for cache_path + suffix");
-    char tmppath[sizeof(((pqc_ctx_t *)0)->cache_path) + 12];
+    _Static_assert(sizeof(((pqc_gcache_t *)0)->path) + 12 <= 528,
+                   "tmppath buffer too small");
+    _Static_assert(sizeof(((pqc_gcache_t *)0)->path) + 8  <= 524,
+                   "lockpath buffer too small");
+
+    char tmppath[sizeof(((pqc_gcache_t *)0)->path) + 12];
+    char lockpath[sizeof(((pqc_gcache_t *)0)->path) + 8];
+    const char *path = gc->path;
     BIO *wbio = NULL;
     int i, ret = 0;
+#ifndef _WIN32
+    int lockfd = -1;
+    int fd;
+#endif
+
+    snprintf(lockpath, sizeof(lockpath), "%s.lock", path);
+    snprintf(tmppath,  sizeof(tmppath),  "%s.tmp.XXXXXX", path);
+
 #ifdef _WIN32
-    const char *path = pctx->cache_path;
-    snprintf(tmppath, sizeof(tmppath), "%s.tmp.XXXXXX", path);
+    /* Cross-process locking on Windows: best-effort; LockFileEx omitted for brevity. */
     if (_mktemp_s(tmppath, sizeof(tmppath)) != 0) goto fail;
     wbio = BIO_new_file(tmppath, "w");
 #else
-    int fd;
-    const char *path = pctx->cache_path;
-    snprintf(tmppath, sizeof(tmppath), "%s.tmp.XXXXXX", path);
+    lockfd = open(lockpath, O_WRONLY | O_CREAT, 0600);
+    if (lockfd < 0) goto fail;
+    if (flock(lockfd, LOCK_EX) != 0) goto fail;
+
     fd = mkstemp(tmppath);
     if (fd < 0) goto fail;
     wbio = BIO_new_fd(fd, BIO_CLOSE);
 #endif
     if (wbio == NULL) goto fail;
 
-    for (i = 0; i < pctx->ncache; i++) {
+    for (i = 0; i < gc->nentries; i++) {
         PQC_CACHE_ENTRY *e = PQC_CACHE_ENTRY_new();
         unsigned char *der = NULL;
         int derlen;
         if (e == NULL) continue;
-        if (!ASN1_STRING_set(e->host, pctx->cache[i].host,
-                             (int)strlen(pctx->cache[i].host))
-                || !ASN1_INTEGER_set(e->port, pctx->cache[i].port)
+        if (!ASN1_STRING_set(e->host, gc->entries[i].host,
+                             (int)strlen(gc->entries[i].host))
+                || !ASN1_INTEGER_set(e->port, gc->entries[i].port)
                 || !ASN1_INTEGER_set_int64(e->expiry,
-                                           (int64_t)pctx->cache[i].expiry)) {
+                                           (int64_t)gc->entries[i].expiry)) {
             PQC_CACHE_ENTRY_free(e);
             continue;
         }
@@ -463,92 +509,113 @@ static int pqc_cache_persist(pqc_ctx_t *pctx)
             OPENSSL_free(der);
         }
     }
-    BIO_free(wbio); wbio = NULL;  /* BIO_free on a file BIO flushes implicitly */
+    BIO_free(wbio); wbio = NULL;
 
 #ifdef _WIN32
     DeleteFileA(path);
     ret = MoveFileA(tmppath, path);
 #else
     ret = (rename(tmppath, path) == 0);
+    flock(lockfd, LOCK_UN);
+    close(lockfd); lockfd = -1;
 #endif
     if (ret) return 1;
+#ifndef _WIN32
     unlink(tmppath);
+#endif
 
 fail:
+#ifndef _WIN32
+    if (lockfd >= 0) { flock(lockfd, LOCK_UN); close(lockfd); }
+#endif
+    if (wbio != NULL) { BIO_free(wbio); unlink(tmppath); }
     {
         static int warned = 0;
         if (!warned) {
             warned = 1;
-            fprintf(stderr, "pqc_continuity: cache write failed for %s, disabling cache\n",
-                    pctx->cache_path);
+            fprintf(stderr, "pqc_continuity: cache write failed for %s, "
+                    "disabling cache\n", path);
         }
     }
-    pctx->cache_enabled = 0;
+    gc->enabled = 0;
     return 0;
 }
 
-/* Update or insert (host, port, expiry) in memory, then persist. */
-/* Grow cache array if full. Returns 1 on success, 0 on alloc failure. */
-static int pqc_cache_grow(pqc_ctx_t *pctx)
+/* Lookup: acquires read lock.  Returns 1 and sets *expiry_out if valid entry found. */
+static int pqc_cache_lookup(pqc_gcache_t *gc, const char *host, int port,
+                             time_t *expiry_out)
 {
-    int newcap = pctx->cache_cap == 0 ? PQC_CACHE_INIT : pctx->cache_cap * 2;
-    pqc_entry_t *p = OPENSSL_realloc(pctx->cache,
-                                      newcap * sizeof(pqc_entry_t));
-    if (p == NULL) return 0;
-    pctx->cache = p;
-    pctx->cache_cap = newcap;
-    return 1;
+    int i, found = 0;
+    if (gc == NULL || !gc->enabled) return 0;
+    if (!CRYPTO_THREAD_read_lock(gc->lock)) return 0;
+    i = pqc_gcache_find(gc, host, port);
+    if (i >= 0 && gc->entries[i].expiry > time(NULL)) {
+        *expiry_out = gc->entries[i].expiry;
+        found = 1;
+    }
+    CRYPTO_THREAD_unlock(gc->lock);
+    return found;
 }
 
-static int pqc_cache_update(pqc_ctx_t *pctx, const char *host, int port,
-                             time_t expiry)
+/* Update or insert.  Acquires write lock.  Returns 1 on success. */
+static int pqc_cache_update(pqc_gcache_t *gc, const char *host, int port,
+                             time_t expiry, uint32_t debug_mask)
 {
-    int i = pqc_cache_find(pctx, host, port);
+    int i, ret = 1;
+    if (gc == NULL) return 0;
+    if (!CRYPTO_THREAD_write_lock(gc->lock)) return 0;
+
+    i = pqc_gcache_find(gc, host, port);
     if (i < 0) {
-        if (pctx->ncache >= pctx->cache_cap && !pqc_cache_grow(pctx))
-            return 0;
-        i = pctx->ncache++;
-        snprintf(pctx->cache[i].host, sizeof(pctx->cache[i].host), "%s", host);
-        pctx->cache[i].port = port;
-    } else if (expiry < pctx->cache[i].expiry) {
-        /* Draft 3.3: SHOULD NOT accept a decrease in validity period.
-         * Leave the existing (longer) expiry untouched. */
-        if (pctx->debug_mask != 0)
+        if (gc->nentries >= gc->cap && !pqc_gcache_grow(gc)) { ret = 0; goto done; }
+        i = gc->nentries++;
+        snprintf(gc->entries[i].host, sizeof(gc->entries[i].host), "%s", host);
+        gc->entries[i].port = port;
+    } else if (expiry < gc->entries[i].expiry) {
+        /* Draft 3.3: SHOULD NOT accept a decrease in validity period. */
+        if (debug_mask != 0)
             fprintf(stderr, "pqc_continuity: ignoring validity decrease for %s:%d "
                     "(cached=%ld, offered=%ld)\n",
-                    host, port, (long)pctx->cache[i].expiry, (long)expiry);
-        return 1;
+                    host, port, (long)gc->entries[i].expiry, (long)expiry);
+        goto done;
     }
-    pctx->cache[i].expiry = expiry;
-    if (pctx->cache_enabled)
-        pqc_cache_persist(pctx);
-    return 1;
+    gc->entries[i].expiry = expiry;
+    if (gc->enabled)
+        pqc_gcache_persist(gc);
+
+done:
+    CRYPTO_THREAD_unlock(gc->lock);
+    return ret;
 }
 
-/* Remove (host, port) from memory (swap with last), then persist. */
-static int pqc_cache_delete(pqc_ctx_t *pctx, const char *host, int port)
+/* Remove (host, port).  Acquires write lock.  Returns 1 if entry was found. */
+static int pqc_cache_delete(pqc_gcache_t *gc, const char *host, int port)
 {
-    int i = pqc_cache_find(pctx, host, port);
-    if (i < 0) return 0;
-    pctx->cache[i] = pctx->cache[--pctx->ncache];
-    if (pctx->cache_enabled)
-        pqc_cache_persist(pctx);
-    return 1;
+    int i;
+    if (gc == NULL) return 0;
+    if (!CRYPTO_THREAD_write_lock(gc->lock)) return 0;
+    i = pqc_gcache_find(gc, host, port);
+    if (i >= 0) {
+        gc->entries[i] = gc->entries[--gc->nentries];
+        if (gc->enabled)
+            pqc_gcache_persist(gc);
+    }
+    CRYPTO_THREAD_unlock(gc->lock);
+    return (i >= 0);
 }
 
 /*
- * Load cache file into pctx->cache[] at init time.
- * Silently ignores missing file or malformed entries.
+ * Load cache file into gc at init time.
+ * Called under pqc_reg_lock write (single init path); no per-cache lock needed.
  */
-static void pqc_cache_load(pqc_ctx_t *pctx)
+static void pqc_gcache_load(pqc_gcache_t *gc)
 {
     BIO *bio;
     char *name = NULL, *header = NULL;
     unsigned char *data = NULL;
     long datalen;
 
-    if (!pctx->cache_enabled) return;
-    bio = BIO_new_file(pctx->cache_path, "r");
+    bio = BIO_new_file(gc->path, "r");
     if (bio == NULL) { ERR_clear_error(); return; }
 
     while (PEM_read_bio(bio, &name, &header, &data, &datalen) == 1) {
@@ -557,22 +624,19 @@ static void pqc_cache_load(pqc_ctx_t *pctx)
             PQC_CACHE_ENTRY *e = d2i_PQC_CACHE_ENTRY(NULL, &p, datalen);
             if (e != NULL) {
                 int slen = e->host->length;
-                int64_t port;
-                int64_t expiry;
-                if (slen > 0 && (size_t)slen < sizeof(pctx->cache[0].host)
-                        && ASN1_INTEGER_get_int64(&port, e->port) == 1
-                        && ASN1_INTEGER_get_int64(&expiry, e->expiry) == 1) {
-                    if (pctx->ncache >= pctx->cache_cap
-                            && !pqc_cache_grow(pctx)) {
+                int64_t port64, expiry64;
+                if (slen > 0 && (size_t)slen < sizeof(gc->entries[0].host)
+                        && ASN1_INTEGER_get_int64(&port64,   e->port)   == 1
+                        && ASN1_INTEGER_get_int64(&expiry64, e->expiry) == 1) {
+                    if (gc->nentries >= gc->cap && !pqc_gcache_grow(gc)) {
                         PQC_CACHE_ENTRY_free(e);
                         break;
                     }
-                    memcpy(pctx->cache[pctx->ncache].host,
-                           e->host->data, slen);
-                    pctx->cache[pctx->ncache].host[slen] = '\0';
-                    pctx->cache[pctx->ncache].port   = (int)port;
-                    pctx->cache[pctx->ncache].expiry = (time_t)expiry;
-                    pctx->ncache++;
+                    memcpy(gc->entries[gc->nentries].host, e->host->data, slen);
+                    gc->entries[gc->nentries].host[slen] = '\0';
+                    gc->entries[gc->nentries].port   = (int)port64;
+                    gc->entries[gc->nentries].expiry = (time_t)expiry64;
+                    gc->nentries++;
                 }
                 PQC_CACHE_ENTRY_free(e);
             }
@@ -735,9 +799,10 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
         }
 
         if (conn->op == PQC_PENDING_UPDATE)
-            pqc_cache_update(conn->pctx, conn->host, conn->port, conn->expiry);
+            pqc_cache_update(pqc_get_gcache(conn->pctx), conn->host, conn->port,
+                             conn->expiry, conn->pctx ? conn->pctx->debug_mask : 0);
         else if (conn->op == PQC_PENDING_DELETE)
-            pqc_cache_delete(conn->pctx, conn->host, conn->port);
+            pqc_cache_delete(pqc_get_gcache(conn->pctx), conn->host, conn->port);
 
         conn->op = PQC_PENDING_NONE;
     }
@@ -768,6 +833,13 @@ static int pqc_encode_ct_ext(uint16_t scheme, uint32_t validity,
     return 1;
 }
 
+/* Convenience: get the gcache for a pctx, or NULL if caching is disabled. */
+static pqc_gcache_t *pqc_get_gcache(const pqc_ctx_t *pctx)
+{
+    if (pctx == NULL || pctx->cache_idx < 0) return NULL;
+    return &pqc_caches[pctx->cache_idx];
+}
+
 /* -------------------------------------------------------------------------
  * Extension callbacks
  * ---------------------------------------------------------------------- */
@@ -780,6 +852,7 @@ static int pqc_add_ch(SSL *s, pqc_ctx_t *pctx,
     int port = 0;
     time_t cached_expiry = 0;
     pqc_conn_t *conn;
+    pqc_gcache_t *gc = pqc_get_gcache(pctx);
 
     if (SSL_is_server(s)) return 0;
 
@@ -796,7 +869,7 @@ static int pqc_add_ch(SSL *s, pqc_ctx_t *pctx,
      * Client won't offer traditional sigalgs to a previously-PQC server.
      */
     pqc_get_host_port(s, host, sizeof(host), &port);
-    if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+    if (pqc_cache_lookup(gc, host, port, &cached_expiry)) {
         char sigalgs[512];
         SSL_CTX *sctx = SSL_get_SSL_CTX(s);
         if (pqc_build_sigalgs_list(sctx, sigalgs, sizeof(sigalgs))) {
@@ -935,6 +1008,7 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
     uint16_t scheme;
     uint32_t validity;
     pqc_conn_t *conn;
+    pqc_gcache_t *gc = pqc_get_gcache(pctx);
 
     if (chainidx != 0) {
         /* CT extension on a non-EE CertificateEntry is a protocol violation. */
@@ -957,7 +1031,7 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
          */
         if (!SSL_is_server(s)) {
             time_t cached_expiry = 0;
-            if (pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+            if (pqc_cache_lookup(gc, host, port, &cached_expiry)) {
                 *al = SSL_AD_HANDSHAKE_FAILURE;
                 return 0; /* downgrade detected */
             }
@@ -1053,12 +1127,19 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
  * ---------------------------------------------------------------------- */
 
 /*
- * Load [pqc_continuity] section from $OPENSSL_CONF into pctx.
- * Returns  1  if section found and not explicitly disabled.
+ * Load [pqc_continuity] from $OPENSSL_CONF.
+ * Fills pctx->validity_period, pctx->debug_mask, and cache_path/cache_enabled
+ * into a temporary struct so the caller can do registry lookup.
+ *
+ * Returns  1  if section found and not disabled.
  * Returns  0  if section absent (silently disabled).
  * Returns -1  if Enable = no (explicitly disabled).
+ *
+ * cache_path_out must be at least 512 bytes; cache_enabled_out is set to 1
+ * if CachePath was present.
  */
-static int pqc_ctx_load_config(pqc_ctx_t *pctx)
+static int pqc_ctx_load_config(pqc_ctx_t *pctx,
+                                char *cache_path_out, int *cache_enabled_out)
 {
     CONF *conf = NULL;
     long eline = 0;
@@ -1070,9 +1151,7 @@ static int pqc_ctx_load_config(pqc_ctx_t *pctx)
     conf = NCONF_new(NULL);
     if (conf == NULL) return 0;
     if (NCONF_load(conf, conffile, &eline) <= 0) {
-        NCONF_free(conf);
-        ERR_clear_error();
-        return 0;
+        NCONF_free(conf); ERR_clear_error(); return 0;
     }
 
     {
@@ -1082,8 +1161,7 @@ static int pqc_ctx_load_config(pqc_ctx_t *pctx)
         if (val != NULL) {
             section_found = 1;
             if (strcasecmp(val, "no") == 0) {
-                NCONF_free(conf);
-                return -1; /* explicitly disabled */
+                NCONF_free(conf); return -1;
             }
         } else { ERR_clear_error(); }
 
@@ -1096,8 +1174,8 @@ static int pqc_ctx_load_config(pqc_ctx_t *pctx)
         val = NCONF_get_string(conf, "pqc_continuity", "CachePath");
         if (val != NULL) {
             section_found = 1;
-            snprintf(pctx->cache_path, sizeof(pctx->cache_path), "%s", val);
-            pctx->cache_enabled = 1;
+            snprintf(cache_path_out, 512, "%s", val);
+            *cache_enabled_out = 1;
         } else { ERR_clear_error(); }
 
         val = NCONF_get_string(conf, "pqc_continuity", "Debug");
@@ -1115,28 +1193,69 @@ static int pqc_ctx_load_config(pqc_ctx_t *pctx)
     return section_found ? 1 : 0;
 }
 
+/*
+ * Look up or create a pqc_gcache_t for the given path.
+ * Must be called with pqc_reg_lock write-held.
+ * Returns the index into pqc_caches[], or -1 on failure.
+ */
+static int pqc_gcache_get_or_create(const char *path)
+{
+    int i;
+
+    /* Search existing entries. */
+    for (i = 0; i < pqc_ncaches; i++) {
+        if (strcmp(pqc_caches[i].path, path) == 0)
+            return i;
+    }
+
+    /* New path — allocate a slot. */
+    if (pqc_ncaches >= PQC_MAX_CACHES) {
+        fprintf(stderr, "pqc_continuity: too many cache paths (max %d), "
+                "disabling cache for %s\n", PQC_MAX_CACHES, path);
+        return -1;
+    }
+
+    i = pqc_ncaches;
+    snprintf(pqc_caches[i].path, sizeof(pqc_caches[i].path), "%s", path);
+    pqc_caches[i].enabled = 1;
+    pqc_caches[i].lock = CRYPTO_THREAD_lock_new();
+    if (pqc_caches[i].lock == NULL) return -1;
+    pqc_gcache_load(&pqc_caches[i]);
+    pqc_ncaches++;
+    return i;
+}
+
 int pqc_cont_init(SSL_CTX *ctx)
 {
     pqc_ctx_t *pctx;
+    char cache_path[512] = "";
+    int cache_enabled = 0;
     int cfg;
     unsigned int contexts;
 
-    /* Register SSL ex_data slot exactly once, thread-safely. */
-    if (!RUN_ONCE(&pqc_ex_idx_once, pqc_ex_idx_init))
-        return 0;
+    /* One-time inits: SSL ex_data slot and registry lock. */
+    if (!RUN_ONCE(&pqc_ex_idx_once, pqc_ex_idx_init)) return 0;
+    if (!RUN_ONCE(&pqc_reg_once,    pqc_reg_init))    return 0;
 
     pctx = OPENSSL_zalloc(sizeof(*pctx));
     if (pctx == NULL) return 0;
+    pctx->cache_idx = -1;
 
-    cfg = pqc_ctx_load_config(pctx);
+    cfg = pqc_ctx_load_config(pctx, cache_path, &cache_enabled);
     if (cfg <= 0) {
         /* 0 = no section (silently disabled), -1 = explicitly disabled */
-        OPENSSL_free(pctx->cache);
         OPENSSL_free(pctx);
         return 1;
     }
 
-    pqc_cache_load(pctx);
+    if (cache_enabled) {
+        /* Registry lookup/insert under write lock. */
+        if (CRYPTO_THREAD_write_lock(pqc_reg_lock)) {
+            pctx->cache_idx = pqc_gcache_get_or_create(cache_path);
+            CRYPTO_THREAD_unlock(pqc_reg_lock);
+        }
+        /* cache_idx == -1 means caching disabled for this ctx; extension still works. */
+    }
 
     contexts = SSL_EXT_CLIENT_HELLO
              | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
@@ -1145,7 +1264,6 @@ int pqc_cont_init(SSL_CTX *ctx)
     if (!SSL_CTX_add_custom_ext(ctx, TLSEXT_TYPE_pq_cert_available, contexts,
                                  pqc_add_cb, pqc_free_cb, pctx,
                                  pqc_parse_cb, pctx)) {
-        OPENSSL_free(pctx->cache);
         OPENSSL_free(pctx);
         return 0;
     }
