@@ -8,18 +8,15 @@
  *
  * ClientHello and CertificateRequest carry an empty extension (presence only).
  *
- * Algorithm list: read from [pqc_continuity] Algorithms in $OPENSSL_CONF.
- * Default (if section absent): extension is disabled (opt-in via config).
- * Names must match EVP_PKEY_get0_type_name() and SSL_set1_sigalgs_list().
+ * PQC algorithm registry: static table of known NIST PQC sigalgs, extensible
+ * at runtime via pqc_cont_register_sigalg() (e.g., from a provider).
  *
  * Cache file format: PEM blocks, type "PQC CERT AVAILABLE CACHE".
- * Each block: DER SEQUENCE { host IA5String, port INTEGER,
- *                            sigalg INTEGER, expiry INTEGER }
+ * Each block: DER SEQUENCE { host IA5String, port INTEGER, expiry INTEGER }
  * Compatible with tests/lib/cache.py (pyasn1).
  *
- * Cache path: $PQC_CONTINUITY_CACHE, else platform default:
- *   macOS:  ~/Library/Application Support/openssl/pqc_continuity_cache.pem
- *   other:  $XDG_CONFIG_HOME/openssl/pqc_continuity_cache.pem
+ * Cache path: read from [pqc_continuity] CachePath in $OPENSSL_CONF.
+ * If absent, caching is disabled (no writes or reads).
  */
 
 #include "ssl_local.h"
@@ -30,13 +27,6 @@
 #include <time.h>
 #include <errno.h>
 
-#ifdef _WIN32
-# include <windows.h>
-# include <shlobj.h>
-#else
-# include <sys/stat.h>
-# include <unistd.h>
-#endif
 
 #include <openssl/ssl.h>
 #include <openssl/tls1.h>
@@ -44,6 +34,7 @@
 #include <openssl/pem.h>
 #include <openssl/bio.h>
 #include <openssl/asn1.h>
+#include <openssl/asn1t.h>
 #include <openssl/err.h>
 #include <openssl/conf.h>
 #include <openssl/crypto.h>
@@ -59,37 +50,134 @@
 /* Extension wire size: 2 bytes sigalg + 4 bytes validity_period. */
 #define PQC_EXT_DATA_LEN  6
 
-/* Maximum number of algorithms in [pqc_continuity] Algorithms. */
-#define PQC_MAX_ALGS  32
+/* Initial allocation for in-memory cache entries. */
+#define PQC_CACHE_INIT  4
 
 /* -------------------------------------------------------------------------
  * Types
  * ---------------------------------------------------------------------- */
 
-/* Algorithm table entry: name → TLS SignatureScheme value. */
+/* Algorithm registry entry: IANA TLS SignatureScheme value. */
 typedef struct {
-    char     name[64];   /* OpenSSL sigalg name, e.g. "mldsa44" */
-    uint16_t scheme;     /* TLS SignatureScheme value */
+    uint16_t scheme;
 } pqc_alg_t;
+
+/* In-memory cache entry. */
+typedef struct {
+    char host[256];
+    int  port;
+    time_t expiry;       /* Unix timestamp */
+} pqc_entry_t;
 
 /* Per-context state, passed via add_arg / parse_arg. */
 typedef struct {
-    int         enabled;
-    uint32_t    validity_period;
-    pqc_alg_t   algs[PQC_MAX_ALGS];
-    int         nalgs;
-    char        sigalgs_list[256];  /* colon-separated, for SSL_set1_sigalgs_list */
-    int         server_sent_cr;
+    uint32_t     validity_period;
+    char         cache_path[512];
+    int          cache_enabled; /* 1 if CachePath was set; 0 = no persistence */
+    int          server_sent_cr;
+    pqc_entry_t *cache;     /* heap-allocated, grown with OPENSSL_realloc */
+    int          ncache;
+    int          cache_cap;
 } pqc_ctx_t;
 
 /* -------------------------------------------------------------------------
- * Algorithm helpers
+ * Global PQC algorithm registry
+ *
+ * Static table of all known NIST PQC sigalgs with IANA-assigned TLS
+ * SignatureScheme values.  Algorithms not yet supported by the current
+ * OpenSSL build are silently skipped at init (pqc_resolve_scheme → 0)
+ * and activate automatically once the build adds support.
+ *
+ * The bar to add an algorithm here is intentionally low: the TLS stack
+ * enforces all normal signature policy (negotiated sigalgs, cert chain
+ * validation).  This table is only a filter for the pq_cert_available
+ * extension — it does not grant any additional trust.
+ *
+ * Extend at runtime with pqc_cont_register_sigalg() (e.g., from a provider).
  * ---------------------------------------------------------------------- */
+
+/* ML-DSA (FIPS 204), IANA values 0x0904–0x0906 */
+#define PQC_MLDSA44   0x0904
+#define PQC_MLDSA65   0x0905
+#define PQC_MLDSA87   0x0906
+
+/* SLH-DSA (FIPS 205), IANA values 0x0911–0x091C */
+#define PQC_SLHDSA_SHA2_128S  0x0911
+#define PQC_SLHDSA_SHA2_128F  0x0912
+#define PQC_SLHDSA_SHA2_192S  0x0913
+#define PQC_SLHDSA_SHA2_192F  0x0914
+#define PQC_SLHDSA_SHA2_256S  0x0915
+#define PQC_SLHDSA_SHA2_256F  0x0916
+#define PQC_SLHDSA_SHAKE_128S 0x0917
+#define PQC_SLHDSA_SHAKE_128F 0x0918
+#define PQC_SLHDSA_SHAKE_192S 0x0919
+#define PQC_SLHDSA_SHAKE_192F 0x091A
+#define PQC_SLHDSA_SHAKE_256S 0x091B
+#define PQC_SLHDSA_SHAKE_256F 0x091C
+
+static pqc_alg_t pqc_alg_registry[] = {
+    /* ML-DSA (FIPS 204) */
+    { PQC_MLDSA44          },
+    { PQC_MLDSA65          },
+    { PQC_MLDSA87          },
+    /* SLH-DSA (FIPS 205) — not yet in this OpenSSL build; skipped at init */
+    { PQC_SLHDSA_SHA2_128S },
+    { PQC_SLHDSA_SHA2_128F },
+    { PQC_SLHDSA_SHA2_192S },
+    { PQC_SLHDSA_SHA2_192F },
+    { PQC_SLHDSA_SHA2_256S },
+    { PQC_SLHDSA_SHA2_256F },
+    { PQC_SLHDSA_SHAKE_128S },
+    { PQC_SLHDSA_SHAKE_128F },
+    { PQC_SLHDSA_SHAKE_192S },
+    { PQC_SLHDSA_SHAKE_192F },
+    { PQC_SLHDSA_SHAKE_256S },
+    { PQC_SLHDSA_SHAKE_256F },
+    { 0 }  /* sentinel */
+};
+
+/* Dynamic extensions registered via pqc_cont_register_sigalg(). */
+static pqc_alg_t  *pqc_dyn_registry  = NULL;
+static int         pqc_dyn_nalloc    = 0;
+static int         pqc_dyn_nentries  = 0;
+
+/*
+ * Register an additional PQC sigalg at runtime (e.g., from a provider).
+ * Returns 1 on success, 0 on failure.
+ */
+int pqc_cont_register_sigalg(uint16_t scheme)
+{
+    pqc_alg_t *p;
+    if (scheme == 0) return 0;
+    if (pqc_dyn_nentries >= pqc_dyn_nalloc) {
+        int newalloc = pqc_dyn_nalloc == 0 ? 4 : pqc_dyn_nalloc * 2;
+        p = OPENSSL_realloc(pqc_dyn_registry, newalloc * sizeof(pqc_alg_t));
+        if (p == NULL) return 0;
+        pqc_dyn_registry = p;
+        pqc_dyn_nalloc = newalloc;
+    }
+    pqc_dyn_registry[pqc_dyn_nentries].scheme = scheme;
+    pqc_dyn_nentries++;
+    return 1;
+}
+
+/* Look up a scheme value in the combined (static + dynamic) registry. */
+static const pqc_alg_t *pqc_alg_by_scheme(uint16_t scheme)
+{
+    int i;
+    for (i = 0; pqc_alg_registry[i].scheme != 0; i++)
+        if (pqc_alg_registry[i].scheme == scheme)
+            return &pqc_alg_registry[i];
+    for (i = 0; i < pqc_dyn_nentries; i++)
+        if (pqc_dyn_registry[i].scheme == scheme)
+            return &pqc_dyn_registry[i];
+    return NULL;
+}
 
 /*
  * Resolve a sigalg name to its TLS SignatureScheme value by walking the
  * SSL_CTX's sigalg_lookup_cache — the same table SSL_set1_sigalgs_list()
- * uses internally.  No hardcoded numeric values or manual table needed.
+ * uses internally.
  */
 static uint16_t pqc_resolve_scheme(SSL_CTX *ctx, const char *name)
 {
@@ -102,167 +190,21 @@ static uint16_t pqc_resolve_scheme(SSL_CTX *ctx, const char *name)
     return 0;
 }
 
-static const pqc_alg_t *pqc_alg_by_scheme(const pqc_ctx_t *pctx, uint16_t scheme)
-{
-    int i;
-    for (i = 0; i < pctx->nalgs; i++)
-        if (pctx->algs[i].scheme == scheme)
-            return &pctx->algs[i];
-    return NULL;
-}
-
-static uint16_t pqc_pkey_to_scheme(const pqc_ctx_t *pctx, EVP_PKEY *pkey)
+/* Return the scheme for a PQC pkey if it's in the registry, else 0. */
+static uint16_t pqc_pkey_to_scheme(SSL_CTX *ctx, EVP_PKEY *pkey)
 {
     const char *alg_name;
-    int i;
+    uint16_t scheme;
 
-    if (pkey == NULL || pctx->nalgs == 0)
-        return 0;
+    if (pkey == NULL) return 0;
     alg_name = EVP_PKEY_get0_type_name(pkey);
-    if (alg_name == NULL)
-        return 0;
-    for (i = 0; i < pctx->nalgs; i++)
-        if (strcasecmp(alg_name, pctx->algs[i].name) == 0)
-            return pctx->algs[i].scheme;
-    return 0;
+    if (alg_name == NULL) return 0;
+    scheme = pqc_resolve_scheme(ctx, alg_name);
+    if (scheme == 0) return 0;
+    /* Confirm it's in the PQC registry (not just any sigalg). */
+    return pqc_alg_by_scheme(scheme) != NULL ? scheme : 0;
 }
 
-/*
- * Parse a comma-separated algorithm list into pctx->algs[] and
- * build pctx->sigalgs_list (colon-separated, for SSL_set1_sigalgs_list).
- */
-static void pqc_parse_alg_list(pqc_ctx_t *pctx, SSL_CTX *ctx, const char *alg_str)
-{
-    char buf[512];
-    char *p, *tok, *save = NULL;
-    char list_buf[256];
-    int list_len = 0;
-
-    pctx->nalgs = 0;
-    pctx->sigalgs_list[0] = '\0';
-
-    snprintf(buf, sizeof(buf), "%s", alg_str);
-
-    for (p = buf; ; p = NULL) {
-#ifdef _WIN32
-        tok = strtok_s(p, ",", &save);
-#else
-        tok = strtok_r(p, ",", &save);
-#endif
-        if (tok == NULL) break;
-
-        /* Trim whitespace */
-        while (*tok == ' ' || *tok == '\t') tok++;
-        {
-            char *end = tok + strlen(tok) - 1;
-            while (end > tok && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n'))
-                *end-- = '\0';
-        }
-        if (*tok == '\0') continue;
-        if (pctx->nalgs >= PQC_MAX_ALGS) break;
-
-        {
-            uint16_t scheme = pqc_resolve_scheme(ctx, tok);
-            if (scheme == 0) {
-                fprintf(stderr, "pqc_continuity: unknown algorithm '%s', skipping\n", tok);
-                continue;
-            }
-            snprintf(pctx->algs[pctx->nalgs].name,
-                     sizeof(pctx->algs[pctx->nalgs].name), "%s", tok);
-            pctx->algs[pctx->nalgs].scheme = scheme;
-            pctx->nalgs++;
-
-            if (list_len > 0 && list_len < (int)sizeof(list_buf) - 1)
-                list_buf[list_len++] = ':';
-            {
-                int rem = (int)sizeof(list_buf) - list_len - 1;
-                int n = snprintf(list_buf + list_len, rem, "%s", tok);
-                if (n > 0 && n < rem)
-                    list_len += n;
-            }
-        }
-    }
-
-    list_buf[list_len] = '\0';
-    snprintf(pctx->sigalgs_list, sizeof(pctx->sigalgs_list), "%s", list_buf);
-}
-
-/* -------------------------------------------------------------------------
- * Cache path / directory helpers
- * ---------------------------------------------------------------------- */
-
-static void pqc_cache_path(char *buf, size_t buflen)
-{
-    const char *env = getenv("PQC_CONTINUITY_CACHE");
-    if (env != NULL) {
-        snprintf(buf, buflen, "%s", env);
-        return;
-    }
-
-#ifdef __APPLE__
-    {
-        const char *home = getenv("HOME");
-        if (home == NULL) home = ".";
-        snprintf(buf, buflen,
-                 "%s/Library/Application Support/openssl/pqc_continuity_cache.pem",
-                 home);
-    }
-#elif defined(_WIN32)
-    {
-        char appdata[MAX_PATH];
-        if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, 0, appdata)))
-            snprintf(buf, buflen, "%s\\openssl\\pqc_continuity_cache.pem", appdata);
-        else
-            snprintf(buf, buflen, "pqc_continuity_cache.pem");
-    }
-#else
-    {
-        const char *xdg = getenv("XDG_CONFIG_HOME");
-        if (xdg != NULL)
-            snprintf(buf, buflen, "%s/openssl/pqc_continuity_cache.pem", xdg);
-        else {
-            const char *home = getenv("HOME");
-            if (home == NULL) home = ".";
-            snprintf(buf, buflen, "%s/.config/openssl/pqc_continuity_cache.pem", home);
-        }
-    }
-#endif
-}
-
-static void pqc_makedirs(const char *path)
-{
-    char tmp[512];
-    char *p;
-
-    snprintf(tmp, sizeof(tmp), "%s", path);
-    p = strrchr(tmp, '/');
-#ifdef _WIN32
-    if (p == NULL) p = strrchr(tmp, '\\');
-#endif
-    if (p == NULL) return;
-    *p = '\0';
-    if (tmp[0] == '\0') return;
-
-#ifdef _WIN32
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '\\' || *p == '/') {
-            char c = *p; *p = '\0';
-            CreateDirectoryA(tmp, NULL);
-            *p = c;
-        }
-    }
-    CreateDirectoryA(tmp, NULL);
-#else
-    for (p = tmp + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, 0700);
-            *p = '/';
-        }
-    }
-    mkdir(tmp, 0700);
-#endif
-}
 
 /* -------------------------------------------------------------------------
  * Per-connection host/port from SSL object
@@ -288,140 +230,197 @@ static void pqc_get_host_port(SSL *s, char *host, size_t hostlen, int *port)
 
 /* -------------------------------------------------------------------------
  * ASN.1 DER encode / decode
- * Schema: SEQUENCE { host IA5String, port INTEGER, sigalg INTEGER, expiry INTEGER }
+ * Schema: SEQUENCE { host IA5String, port INTEGER, expiry INTEGER }
  * ---------------------------------------------------------------------- */
 
-/* Push a long integer onto an ASN1_SEQUENCE_ANY. Returns 0 on failure. */
-static int pqc_seq_add_integer(ASN1_SEQUENCE_ANY *seq, long val)
+typedef struct {
+    ASN1_IA5STRING *host;
+    ASN1_INTEGER   *port;
+    ASN1_INTEGER   *expiry;
+} PQC_CACHE_ENTRY;
+
+ASN1_SEQUENCE(PQC_CACHE_ENTRY) = {
+    ASN1_SIMPLE(PQC_CACHE_ENTRY, host,   ASN1_IA5STRING),
+    ASN1_SIMPLE(PQC_CACHE_ENTRY, port,   ASN1_INTEGER),
+    ASN1_SIMPLE(PQC_CACHE_ENTRY, expiry, ASN1_INTEGER),
+} ASN1_SEQUENCE_END(PQC_CACHE_ENTRY)
+
+IMPLEMENT_ASN1_FUNCTIONS(PQC_CACHE_ENTRY)
+
+/* -------------------------------------------------------------------------
+ * Cache: in-memory operations + atomic file persistence
+ *
+ * The in-memory array (pctx->cache[]) is the authoritative state.
+ * The file is written atomically (temp + rename) on every change.
+ * Multiple processes sharing the same file are not explicitly coordinated
+ * beyond the atomic rename; this is sufficient for the POC.
+ * ---------------------------------------------------------------------- */
+
+/* Find index of (host, port) in cache, or -1. Ignores expiry. */
+static int pqc_cache_find(const pqc_ctx_t *pctx, const char *host, int port)
 {
-    ASN1_TYPE *t = ASN1_TYPE_new();
-    if (t == NULL) return 0;
-    t->type = V_ASN1_INTEGER;
-    t->value.integer = ASN1_INTEGER_new();
-    if (t->value.integer == NULL || !ASN1_INTEGER_set_int64(t->value.integer, val)
-            || !sk_ASN1_TYPE_push(seq, t)) {
-        ASN1_TYPE_free(t);
-        return 0;
-    }
+    int i;
+    for (i = 0; i < pctx->ncache; i++)
+        if (pctx->cache[i].port == port
+                && strcmp(pctx->cache[i].host, host) == 0)
+            return i;
+    return -1;
+}
+
+/* Lookup: return 1 and set *expiry_out if a valid (unexpired) entry exists. */
+static int pqc_cache_lookup(const pqc_ctx_t *pctx, const char *host, int port,
+                             time_t *expiry_out)
+{
+    int i = pqc_cache_find(pctx, host, port);
+    if (i < 0) return 0;
+    if (pctx->cache[i].expiry <= time(NULL)) return 0;
+    *expiry_out = pctx->cache[i].expiry;
     return 1;
 }
 
-static unsigned char *pqc_encode_entry(const char *host, int port,
-                                        int sigalg, long expiry, int *out_len)
+/*
+ * Persist the full in-memory cache to disk atomically (temp + rename).
+ * No-op if cache is not enabled.
+ */
+static int pqc_cache_persist(pqc_ctx_t *pctx)
 {
-    ASN1_SEQUENCE_ANY *seq = sk_ASN1_TYPE_new_null();
-    ASN1_TYPE *t;
-    unsigned char *der = NULL;
-    int len;
+    char tmppath[528];
+    BIO *wbio = NULL;
+    int i, ret = 0;
+#ifdef _WIN32
+    const char *path = pctx->cache_path;
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp.XXXXXX", path);
+    if (_mktemp_s(tmppath, sizeof(tmppath)) != 0) goto fail;
+    wbio = BIO_new_file(tmppath, "w");
+#else
+    int fd;
+    const char *path = pctx->cache_path;
+    snprintf(tmppath, sizeof(tmppath), "%s.tmp.XXXXXX", path);
+    fd = mkstemp(tmppath);
+    if (fd < 0) goto fail;
+    wbio = BIO_new_fd(fd, BIO_CLOSE);
+#endif
+    if (wbio == NULL) goto fail;
 
-    if (seq == NULL) return NULL;
-
-    /* host IA5String */
-    t = ASN1_TYPE_new();
-    if (t == NULL) goto err;
-    t->type = V_ASN1_IA5STRING;
-    t->value.ia5string = ASN1_IA5STRING_new();
-    if (t->value.ia5string == NULL
-            || !ASN1_STRING_set(t->value.ia5string, host, (int)strlen(host))
-            || !sk_ASN1_TYPE_push(seq, t)) {
-        ASN1_TYPE_free(t);
-        goto err;
+    for (i = 0; i < pctx->ncache; i++) {
+        PQC_CACHE_ENTRY *e = PQC_CACHE_ENTRY_new();
+        unsigned char *der = NULL;
+        int derlen;
+        if (e == NULL) continue;
+        if (!ASN1_STRING_set(e->host, pctx->cache[i].host,
+                             (int)strlen(pctx->cache[i].host))
+                || !ASN1_INTEGER_set(e->port, pctx->cache[i].port)
+                || !ASN1_INTEGER_set_int64(e->expiry,
+                                           (int64_t)pctx->cache[i].expiry)) {
+            PQC_CACHE_ENTRY_free(e);
+            continue;
+        }
+        derlen = i2d_PQC_CACHE_ENTRY(e, &der);
+        PQC_CACHE_ENTRY_free(e);
+        if (derlen > 0) {
+            PEM_write_bio(wbio, PQC_PEM_TYPE, "", der, derlen);
+            OPENSSL_free(der);
+        }
     }
+    BIO_flush(wbio);
+    BIO_free(wbio); wbio = NULL;
 
-    if (!pqc_seq_add_integer(seq, (long)port)
-            || !pqc_seq_add_integer(seq, (long)sigalg)
-            || !pqc_seq_add_integer(seq, expiry))
-        goto err;
+#ifdef _WIN32
+    DeleteFileA(path);
+    ret = MoveFileA(tmppath, path);
+#else
+    ret = (rename(tmppath, path) == 0);
+#endif
+    if (ret) return 1;
+    unlink(tmppath);
 
-    len = i2d_ASN1_SEQUENCE_ANY(seq, &der);
-    if (len <= 0) { der = NULL; goto err; }
-    *out_len = len;
-
-err:
-    sk_ASN1_TYPE_pop_free(seq, ASN1_TYPE_free);
-    return der;
+fail:
+    fprintf(stderr, "pqc_continuity: cache write failed for %s, disabling cache\n",
+            pctx->cache_path);
+    pctx->cache_enabled = 0;
+    return 0;
 }
 
-static int pqc_decode_entry(const unsigned char *der, int len,
-                             char *host, size_t hostlen,
-                             int *port, int *sigalg, long *expiry)
+/* Update or insert (host, port, expiry) in memory, then persist. */
+/* Grow cache array if full. Returns 1 on success, 0 on alloc failure. */
+static int pqc_cache_grow(pqc_ctx_t *pctx)
 {
-    const unsigned char *p = der;
-    ASN1_SEQUENCE_ANY *seq = NULL;
-    ASN1_TYPE *t;
-    int ret = 0;
-
-    seq = d2i_ASN1_SEQUENCE_ANY(NULL, &p, len);
-    if (seq == NULL || sk_ASN1_TYPE_num(seq) != 4)
-        goto err;
-
-    t = sk_ASN1_TYPE_value(seq, 0);
-    if (t->type != V_ASN1_IA5STRING) goto err;
-    {
-        int slen = t->value.ia5string->length;
-        if (slen < 0 || (size_t)slen >= hostlen) goto err;
-        memcpy(host, t->value.ia5string->data, slen);
-        host[slen] = '\0';
-    }
-
-    t = sk_ASN1_TYPE_value(seq, 1);
-    if (t->type != V_ASN1_INTEGER) goto err;
-    *port = (int)ASN1_INTEGER_get(t->value.integer);
-
-    t = sk_ASN1_TYPE_value(seq, 2);
-    if (t->type != V_ASN1_INTEGER) goto err;
-    *sigalg = (int)ASN1_INTEGER_get(t->value.integer);
-
-    t = sk_ASN1_TYPE_value(seq, 3);
-    if (t->type != V_ASN1_INTEGER) goto err;
-    {
-        int64_t v = 0;
-        ASN1_INTEGER_get_int64(&v, t->value.integer);
-        *expiry = (long)v;
-    }
-
-    ret = 1;
-err:
-    if (seq != NULL)
-        sk_ASN1_TYPE_pop_free(seq, ASN1_TYPE_free);
-    return ret;
+    int newcap = pctx->cache_cap == 0 ? PQC_CACHE_INIT : pctx->cache_cap * 2;
+    pqc_entry_t *p = OPENSSL_realloc(pctx->cache,
+                                      newcap * sizeof(pqc_entry_t));
+    if (p == NULL) return 0;
+    pctx->cache = p;
+    pctx->cache_cap = newcap;
+    return 1;
 }
 
-/* -------------------------------------------------------------------------
- * Cache read / write
- * ---------------------------------------------------------------------- */
-
-static int pqc_cache_lookup(const char *host, int port,
-                             int *sigalg, long *expiry_out)
+static int pqc_cache_update(pqc_ctx_t *pctx, const char *host, int port,
+                             time_t expiry)
 {
-    char path[512];
-    BIO *bio = NULL;
+    int i = pqc_cache_find(pctx, host, port);
+    if (i < 0) {
+        if (pctx->ncache >= pctx->cache_cap && !pqc_cache_grow(pctx))
+            return 0;
+        i = pctx->ncache++;
+        snprintf(pctx->cache[i].host, sizeof(pctx->cache[i].host), "%s", host);
+        pctx->cache[i].port = port;
+    }
+    pctx->cache[i].expiry = expiry;
+    if (pctx->cache_enabled)
+        pqc_cache_persist(pctx);
+    return 1;
+}
+
+/* Remove (host, port) from memory (swap with last), then persist. */
+static int pqc_cache_delete(pqc_ctx_t *pctx, const char *host, int port)
+{
+    int i = pqc_cache_find(pctx, host, port);
+    if (i < 0) return 0;
+    pctx->cache[i] = pctx->cache[--pctx->ncache];
+    if (pctx->cache_enabled)
+        pqc_cache_persist(pctx);
+    return 1;
+}
+
+/*
+ * Load cache file into pctx->cache[] at init time.
+ * Silently ignores missing file or malformed entries.
+ */
+static void pqc_cache_load(pqc_ctx_t *pctx)
+{
+    BIO *bio;
     char *name = NULL, *header = NULL;
     unsigned char *data = NULL;
     long datalen;
-    int found = 0;
-    time_t now = time(NULL);
 
-    pqc_cache_path(path, sizeof(path));
-    bio = BIO_new_file(path, "r");
-    if (bio == NULL) { ERR_clear_error(); return 0; }
+    if (!pctx->cache_enabled) return;
+    bio = BIO_new_file(pctx->cache_path, "r");
+    if (bio == NULL) { ERR_clear_error(); return; }
 
     while (PEM_read_bio(bio, &name, &header, &data, &datalen) == 1) {
         if (strcmp(name, PQC_PEM_TYPE) == 0) {
-            char h[256];
-            int p = 0, sa = 0;
-            long exp = 0;
-            if (pqc_decode_entry(data, (int)datalen, h, sizeof(h), &p, &sa, &exp)
-                    && strcmp(h, host) == 0 && p == port) {
-                if (exp > (long)now) {
-                    *sigalg = sa;
-                    *expiry_out = exp;
-                    found = 1;
+            const unsigned char *p = data;
+            PQC_CACHE_ENTRY *e = d2i_PQC_CACHE_ENTRY(NULL, &p, datalen);
+            if (e != NULL) {
+                int slen = e->host->length;
+                int64_t port;
+                int64_t expiry;
+                if (slen > 0 && (size_t)slen < sizeof(pctx->cache[0].host)
+                        && ASN1_INTEGER_get_int64(&port, e->port) == 1
+                        && ASN1_INTEGER_get_int64(&expiry, e->expiry) == 1) {
+                    if (pctx->ncache >= pctx->cache_cap
+                            && !pqc_cache_grow(pctx)) {
+                        PQC_CACHE_ENTRY_free(e);
+                        break;
+                    }
+                    memcpy(pctx->cache[pctx->ncache].host,
+                           e->host->data, slen);
+                    pctx->cache[pctx->ncache].host[slen] = '\0';
+                    pctx->cache[pctx->ncache].port   = (int)port;
+                    pctx->cache[pctx->ncache].expiry = (time_t)expiry;
+                    pctx->ncache++;
                 }
-                OPENSSL_free(name);
-                OPENSSL_free(header);
-                OPENSSL_free(data);
-                break;
+                PQC_CACHE_ENTRY_free(e);
             }
         }
         OPENSSL_free(name); name = NULL;
@@ -430,118 +429,6 @@ static int pqc_cache_lookup(const char *host, int port,
     }
     ERR_clear_error();
     BIO_free(bio);
-    return found;
-}
-
-/*
- * Open a temp file for writing the new cache, copy existing entries
- * (optionally excluding a given host:port), write them to wbio.
- * Returns an open BIO on the temp file, or NULL on error.
- * Caller must rename tmppath → path and free wbio.
- */
-static BIO *pqc_cache_open_tmp(const char *path, char *tmppath, size_t tmplen,
-                                const char *exclude_host, int exclude_port)
-{
-    BIO *rbio = NULL, *wbio = NULL;
-    char *name = NULL, *header = NULL;
-    unsigned char *data = NULL;
-    long datalen;
-#ifdef _WIN32
-    snprintf(tmppath, tmplen, "%s.tmp.XXXXXX", path);
-    if (_mktemp_s(tmppath, tmplen) != 0) return NULL;
-    wbio = BIO_new_file(tmppath, "w");
-#else
-    int fd;
-    snprintf(tmppath, tmplen, "%s.tmp.XXXXXX", path);
-    fd = mkstemp(tmppath);
-    if (fd < 0) return NULL;
-    wbio = BIO_new_fd(fd, BIO_CLOSE);
-#endif
-    if (wbio == NULL) return NULL;
-
-    rbio = BIO_new_file(path, "r");
-    if (rbio != NULL) {
-        while (PEM_read_bio(rbio, &name, &header, &data, &datalen) == 1) {
-            if (strcmp(name, PQC_PEM_TYPE) == 0) {
-                char h[256];
-                int p = 0, sa = 0;
-                long exp = 0;
-                int skip = exclude_host != NULL
-                    && pqc_decode_entry(data, (int)datalen, h, sizeof(h), &p, &sa, &exp)
-                    && strcmp(h, exclude_host) == 0 && p == exclude_port;
-                if (!skip)
-                    PEM_write_bio(wbio, PQC_PEM_TYPE, "", data, datalen);
-            }
-            OPENSSL_free(name); name = NULL;
-            OPENSSL_free(header); header = NULL;
-            OPENSSL_free(data); data = NULL;
-        }
-        ERR_clear_error();
-        BIO_free(rbio);
-    } else {
-        ERR_clear_error();
-    }
-    OPENSSL_free(name);
-    OPENSSL_free(header);
-    OPENSSL_free(data);
-    return wbio;
-}
-
-static int pqc_cache_update(const char *host, int port, int sigalg, long expiry)
-{
-    char path[512], tmppath[528];
-    unsigned char *newder = NULL;
-    int newlen = 0, ret = 0;
-    BIO *wbio = NULL;
-
-    pqc_cache_path(path, sizeof(path));
-    pqc_makedirs(path);
-
-    wbio = pqc_cache_open_tmp(path, tmppath, sizeof(tmppath), host, port);
-    if (wbio == NULL) return 0;
-
-    newder = pqc_encode_entry(host, port, sigalg, expiry, &newlen);
-    if (newder == NULL) goto err;
-
-    PEM_write_bio(wbio, PQC_PEM_TYPE, "", newder, newlen);
-    BIO_flush(wbio);
-    BIO_free(wbio); wbio = NULL;
-
-#ifdef _WIN32
-    DeleteFileA(path);
-    if (!MoveFileA(tmppath, path)) goto err;
-#else
-    if (rename(tmppath, path) != 0) goto err;
-#endif
-    ret = 1;
-
-err:
-    if (wbio != NULL) { BIO_free(wbio); unlink(tmppath); }
-    OPENSSL_free(newder);
-    return ret;
-}
-
-static int pqc_cache_delete(const char *host, int port)
-{
-    char path[512], tmppath[528];
-    int ret = 0;
-    BIO *wbio;
-
-    pqc_cache_path(path, sizeof(path));
-    wbio = pqc_cache_open_tmp(path, tmppath, sizeof(tmppath), host, port);
-    if (wbio == NULL) return 0;
-
-    BIO_flush(wbio);
-    BIO_free(wbio);
-
-#ifdef _WIN32
-    DeleteFileA(path);
-    if (!MoveFileA(tmppath, path)) return 0;
-#else
-    if (rename(tmppath, path) != 0) return 0;
-#endif
-    ret = 1;
-    return ret;
 }
 
 /* -------------------------------------------------------------------------
@@ -556,27 +443,10 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
 {
     pqc_ctx_t *pctx = (pqc_ctx_t *)add_arg;
 
-    if (pctx == NULL || !pctx->enabled)
-        return 0;
+    if (pctx == NULL) return 0;
 
     if (context & SSL_EXT_CLIENT_HELLO) {
         if (SSL_is_server(s)) return 0;
-
-        /* On cache hit, restrict offered sigalgs to PQC-only before CH goes out. */
-        {
-            char host[256];
-            int port = 0, cached_sigalg = 0;
-            long cached_expiry = 0;
-
-            pqc_get_host_port(s, host, sizeof(host), &port);
-            if (pqc_cache_lookup(host, port, &cached_sigalg, &cached_expiry)
-                    && pqc_alg_by_scheme(pctx, (uint16_t)cached_sigalg) != NULL
-                    && pctx->sigalgs_list[0] != '\0') {
-                if (!SSL_set1_sigalgs_list(s, pctx->sigalgs_list))
-                    ERR_clear_error(); /* non-fatal */
-            }
-        }
-
         *out = NULL; *outlen = 0;
         return 1;
     }
@@ -595,7 +465,7 @@ static int pqc_add_cb(SSL *s, unsigned int ext_type,
         if (chainidx != 0) return 0;
 
         pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
-        scheme = pqc_pkey_to_scheme(pctx, pkey);
+        scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
         if (scheme == 0 || pctx->validity_period == 0) {
             /*
              * Traditional cert, or no ValidityPeriod configured: send empty
@@ -638,8 +508,7 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
 {
     pqc_ctx_t *pctx = (pqc_ctx_t *)parse_arg;
 
-    if (pctx == NULL || !pctx->enabled)
-        return 1;
+    if (pctx == NULL) return 1;
 
     if (context & SSL_EXT_CLIENT_HELLO)
         return 1; /* server notes client support; no payload */
@@ -651,29 +520,44 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
     }
 
     if (context & SSL_EXT_TLS1_3_CERTIFICATE) {
-        uint16_t scheme;
-        uint32_t validity;
         char host[256];
         int port = 0;
 
         if (chainidx != 0) return 1;
-        if (inlen == 0)    return 1; /* empty: no cache update */
-        if (inlen != PQC_EXT_DATA_LEN) { *al = SSL_AD_DECODE_ERROR; return 0; }
-
-        scheme   = ((uint16_t)in[0] << 8) | (uint16_t)in[1];
-        validity = ((uint32_t)in[2] << 24) | ((uint32_t)in[3] << 16)
-                 | ((uint32_t)in[4] <<  8) |  (uint32_t)in[5];
-
-        if (pqc_alg_by_scheme(pctx, scheme) == NULL)
-            return 1; /* not in configured list: ignore per §3.3 */
 
         pqc_get_host_port(s, host, sizeof(host), &port);
 
-        if (validity == 0)
-            pqc_cache_delete(host, port);
-        else
-            pqc_cache_update(host, port, (int)scheme,
-                             (long)time(NULL) + (long)validity);
+        if (inlen == 0) {
+            /*
+             * Empty extension: server signals PQC support but sends no cache
+             * instruction.  If we have a cache entry for this host:port and
+             * the server sent no PQC cert, that is a downgrade — abort.
+             */
+            time_t cached_expiry = 0;
+            if (!SSL_is_server(s)
+                    && pqc_cache_lookup(pctx, host, port, &cached_expiry)) {
+                *al = SSL_AD_HANDSHAKE_FAILURE;
+                return 0; /* downgrade detected */
+            }
+            return 1;
+        }
+
+        if (inlen != PQC_EXT_DATA_LEN) { *al = SSL_AD_DECODE_ERROR; return 0; }
+
+        {
+            uint16_t scheme   = ((uint16_t)in[0] << 8) | (uint16_t)in[1];
+            uint32_t validity = ((uint32_t)in[2] << 24) | ((uint32_t)in[3] << 16)
+                              | ((uint32_t)in[4] <<  8) |  (uint32_t)in[5];
+
+            if (pqc_alg_by_scheme(scheme) == NULL)
+                return 1; /* not a known PQC alg: ignore per §3.3 */
+
+            if (validity == 0)
+                pqc_cache_delete(pctx, host, port);
+            else
+                pqc_cache_update(pctx, host, port,
+                                 (long)time(NULL) + (long)validity);
+        }
     }
 
     return 1;
@@ -686,15 +570,12 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
 int pqc_cont_init(SSL_CTX *ctx)
 {
     pqc_ctx_t *pctx;
-    const char *alg_str = NULL;
-    char alg_buf[512];
     int section_found = 0;
     unsigned int contexts;
 
     pctx = OPENSSL_zalloc(sizeof(*pctx));
     if (pctx == NULL) return 0;
 
-    pctx->enabled = 1;
     /* validity_period stays 0 until set by ValidityPeriod in config */
 
     /* Read [pqc_continuity] from $OPENSSL_CONF; no-op if section absent. */
@@ -711,17 +592,12 @@ int pqc_cont_init(SSL_CTX *ctx)
                 val = NCONF_get_string(conf, "pqc_continuity", "Enable");
                 if (val != NULL) {
                     section_found = 1;
-                    if (strcasecmp(val, "no") == 0)
-                        pctx->enabled = 0;
-                } else {
-                    ERR_clear_error();
-                }
-
-                val = NCONF_get_string(conf, "pqc_continuity", "Algorithms");
-                if (val != NULL) {
-                    section_found = 1;
-                    snprintf(alg_buf, sizeof(alg_buf), "%s", val);
-                    alg_str = alg_buf;
+                    if (strcasecmp(val, "no") == 0) {
+                        NCONF_free(conf);
+                        OPENSSL_free(pctx->cache);
+                        OPENSSL_free(pctx);
+                        return 1; /* explicitly disabled: do not register extension */
+                    }
                 } else {
                     ERR_clear_error();
                 }
@@ -733,6 +609,15 @@ int pqc_cont_init(SSL_CTX *ctx)
                 } else {
                     ERR_clear_error();
                 }
+
+                val = NCONF_get_string(conf, "pqc_continuity", "CachePath");
+                if (val != NULL) {
+                    section_found = 1;
+                    snprintf(pctx->cache_path, sizeof(pctx->cache_path), "%s", val);
+                    pctx->cache_enabled = 1;
+                } else {
+                    ERR_clear_error();
+                }
             }
             NCONF_free(conf);
             ERR_clear_error();
@@ -740,18 +625,12 @@ int pqc_cont_init(SSL_CTX *ctx)
     }
 
     if (!section_found) {
+        OPENSSL_free(pctx->cache);
         OPENSSL_free(pctx);
         return 1; /* no config section: silently disabled */
     }
 
-    if (alg_str != NULL)
-        pqc_parse_alg_list(pctx, ctx, alg_str);
-
-    if (pctx->nalgs == 0 && pctx->enabled) {
-        fprintf(stderr, "pqc_continuity: no valid PQC algorithms configured, "
-                        "extension disabled\n");
-        pctx->enabled = 0;
-    }
+    pqc_cache_load(pctx);
 
     contexts = SSL_EXT_CLIENT_HELLO
              | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
@@ -760,6 +639,7 @@ int pqc_cont_init(SSL_CTX *ctx)
     if (!SSL_CTX_add_custom_ext(ctx, TLSEXT_TYPE_pq_cert_available, contexts,
                                  pqc_add_cb, pqc_free_cb, pctx,
                                  pqc_parse_cb, pctx)) {
+        OPENSSL_free(pctx->cache);
         OPENSSL_free(pctx);
         return 0;
     }
