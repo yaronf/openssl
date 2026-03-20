@@ -82,7 +82,8 @@ typedef struct {
  * Debug bitmask (Debug config key, hex) for fault injection in tests.
  * See docs/POC-PLAN.md § Debug Bitmask.
  */
-#define PQC_DEBUG_MALFORMED_EXT    0x08  /* server sends wrong-length CT ext */
+#define PQC_DEBUG_VERBOSE               0x01  /* enable protocol trace logging (no fault injection) */
+#define PQC_DEBUG_MALFORMED_EXT         0x08  /* server sends wrong-length CT ext */
 #define PQC_DEBUG_CT_ON_INTERMEDIATE    0x40  /* server sends CT on both EE (chainidx 0) AND intermediate (chainidx 1) */
 #define PQC_DEBUG_CT_ONLY_INTERMEDIATE  0x80  /* server sends CT on intermediate (chainidx 1) ONLY, skipping EE */
 
@@ -987,13 +988,9 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
         return 1;
     }
 
-    /* Resolve cache key; -1 means skip cache but still validate. */
-    {
-        int r = !SSL_is_server(s)
-                ? pqc_client_get_host_port(s, host, sizeof(host), &port)
-                : -1;
-        have_key = (r == 0);
-    }
+    /* Resolve cache key; skip cache (but still validate) if unavailable. */
+    have_key = !SSL_is_server(s)
+               && pqc_client_get_host_port(s, host, sizeof(host), &port) == 0;
 
     if (inlen == 0) {
         /*
