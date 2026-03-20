@@ -3,8 +3,8 @@
  * Experimental POC implementation.
  *
  * Extension wire format (Certificate message, first CertificateEntry only):
- *   uint16 signature_algorithm
  *   uint32 algorithm_validity_period  (seconds; 0 = do not cache / clear cache)
+ *   (signature_algorithm field dropped — presence of a PQC cert is sufficient)
  *
  * ClientHello and CertificateRequest carry an empty extension (presence only).
  *
@@ -69,9 +69,7 @@
  * ---------------------------------------------------------------------- */
 
 /* Algorithm registry entry: IANA TLS SignatureScheme value. */
-typedef struct {
-    uint16_t scheme;
-} pqc_alg_t;
+typedef uint16_t pqc_alg_t;
 
 /* In-memory cache entry. */
 typedef struct {
@@ -210,23 +208,23 @@ DEFINE_RUN_ONCE_STATIC(pqc_ex_idx_init)
 
 static pqc_alg_t pqc_alg_registry[] = {
     /* ML-DSA (FIPS 204) */
-    { PQC_MLDSA44          },
-    { PQC_MLDSA65          },
-    { PQC_MLDSA87          },
+    PQC_MLDSA44,
+    PQC_MLDSA65,
+    PQC_MLDSA87,
     /* SLH-DSA (FIPS 205) — not yet in this OpenSSL build; skipped at init */
-    { PQC_SLHDSA_SHA2_128S },
-    { PQC_SLHDSA_SHA2_128F },
-    { PQC_SLHDSA_SHA2_192S },
-    { PQC_SLHDSA_SHA2_192F },
-    { PQC_SLHDSA_SHA2_256S },
-    { PQC_SLHDSA_SHA2_256F },
-    { PQC_SLHDSA_SHAKE_128S },
-    { PQC_SLHDSA_SHAKE_128F },
-    { PQC_SLHDSA_SHAKE_192S },
-    { PQC_SLHDSA_SHAKE_192F },
-    { PQC_SLHDSA_SHAKE_256S },
-    { PQC_SLHDSA_SHAKE_256F },
-    { 0 }  /* sentinel */
+    PQC_SLHDSA_SHA2_128S,
+    PQC_SLHDSA_SHA2_128F,
+    PQC_SLHDSA_SHA2_192S,
+    PQC_SLHDSA_SHA2_192F,
+    PQC_SLHDSA_SHA2_256S,
+    PQC_SLHDSA_SHA2_256F,
+    PQC_SLHDSA_SHAKE_128S,
+    PQC_SLHDSA_SHAKE_128F,
+    PQC_SLHDSA_SHAKE_192S,
+    PQC_SLHDSA_SHAKE_192F,
+    PQC_SLHDSA_SHAKE_256S,
+    PQC_SLHDSA_SHAKE_256F,
+    0  /* sentinel */
 };
 
 /*
@@ -269,7 +267,7 @@ int pqc_cont_register_sigalg(uint16_t scheme)
         }
     }
     if (pqc_dyn_nentries < pqc_dyn_nalloc) {
-        pqc_dyn_registry[pqc_dyn_nentries].scheme = scheme;
+        pqc_dyn_registry[pqc_dyn_nentries] = scheme;
         pqc_dyn_nentries++;
         ret = 1;
     }
@@ -278,27 +276,26 @@ int pqc_cont_register_sigalg(uint16_t scheme)
     return ret;
 }
 
-/* Look up a scheme value in the combined (static + dynamic) registry. */
-static const pqc_alg_t *pqc_alg_by_scheme(uint16_t scheme)
+/* Return 1 if scheme is in the combined (static + dynamic) registry. */
+static int pqc_alg_by_scheme(uint16_t scheme)
 {
     int i;
-    const pqc_alg_t *found = NULL;
 
-    for (i = 0; pqc_alg_registry[i].scheme != 0; i++)
-        if (pqc_alg_registry[i].scheme == scheme)
-            return &pqc_alg_registry[i];
+    for (i = 0; pqc_alg_registry[i] != 0; i++)
+        if (pqc_alg_registry[i] == scheme)
+            return 1;
 
     /* Dynamic registry requires lock. */
     if (pqc_dyn_lock != NULL && CRYPTO_THREAD_read_lock(pqc_dyn_lock)) {
         for (i = 0; i < pqc_dyn_nentries; i++) {
-            if (pqc_dyn_registry[i].scheme == scheme) {
-                found = &pqc_dyn_registry[i];
-                break;
+            if (pqc_dyn_registry[i] == scheme) {
+                CRYPTO_THREAD_unlock(pqc_dyn_lock);
+                return 1;
             }
         }
         CRYPTO_THREAD_unlock(pqc_dyn_lock);
     }
-    return found;
+    return 0;
 }
 
 /*
@@ -324,7 +321,7 @@ static int pqc_is_pqc_cert(SSL_CTX *ctx, EVP_PKEY *pkey)
     for (i = 0; i < ctx->sigalg_lookup_cache_len; i++) {
         const SIGALG_LOOKUP *lu = &ctx->sigalg_lookup_cache[i];
         if (lu->sig == nid && lu->sigalg != 0
-                && pqc_alg_by_scheme(lu->sigalg) != NULL)
+                && pqc_alg_by_scheme(lu->sigalg))
             return 1;
     }
     return 0;
@@ -436,13 +433,12 @@ static int pqc_gcache_find(const pqc_gcache_t *gc, const char *host, int port)
  */
 static int pqc_gcache_persist(pqc_gcache_t *gc)
 {
-    _Static_assert(sizeof(((pqc_gcache_t *)0)->path) + 12 <= 528,
-                   "tmppath buffer too small");
-    _Static_assert(sizeof(((pqc_gcache_t *)0)->path) + 8  <= 524,
-                   "lockpath buffer too small");
-
-    char tmppath[sizeof(((pqc_gcache_t *)0)->path) + 12];
-    char lockpath[sizeof(((pqc_gcache_t *)0)->path) + 8];
+    char tmppath[sizeof(((pqc_gcache_t *)0)->path) + 12];   /* path + ".tmp.XXXXXX\0" */
+    char lockpath[sizeof(((pqc_gcache_t *)0)->path) + 6];   /* path + ".lock\0" */
+    _Static_assert(sizeof(tmppath)  == sizeof(((pqc_gcache_t *)0)->path) + 12,
+                   "tmppath buffer sized for path + .tmp.XXXXXX");
+    _Static_assert(sizeof(lockpath) == sizeof(((pqc_gcache_t *)0)->path) + 6,
+                   "lockpath buffer sized for path + .lock");
     const char *path = gc->path;
     BIO *wbio = NULL;
     int i, ret = 0;
@@ -492,10 +488,14 @@ static int pqc_gcache_persist(pqc_gcache_t *gc)
     BIO_free(wbio); wbio = NULL;
 
 #ifdef _WIN32
+    /* Note: DeleteFile+MoveFile is not atomic — there is a window where the
+     * file does not exist.  Atomic replace on Windows requires MoveFileEx with
+     * MOVEFILE_REPLACE_EXISTING, but that also has edge cases with open handles.
+     * Acceptable for this POC. */
     DeleteFileA(path);
     ret = MoveFileA(tmppath, path);
 #else
-    ret = (rename(tmppath, path) == 0);
+    ret = (rename(tmppath, path) == 0);  /* atomic on POSIX */
     flock(lockfd, LOCK_UN);
     close(lockfd); lockfd = -1;
 #endif
@@ -648,7 +648,7 @@ static int pqc_build_sigalgs_list(SSL_CTX *ctx, char *buf, size_t buflen)
         size_t nlen;
 
         if (lu->sigalg == 0 || lu->name == NULL) continue;
-        if (pqc_alg_by_scheme(lu->sigalg) == NULL) continue;
+        if (!pqc_alg_by_scheme(lu->sigalg)) continue;
 
         nlen = strlen(lu->name);
         if (pos + nlen + 2 > buflen) break;  /* +2 for ':' and NUL */
@@ -693,6 +693,13 @@ static pqc_conn_t *pqc_conn_get_or_create(SSL *s, pqc_ctx_t *pctx)
     return conn;
 }
 
+/* Read-only variant: return existing pqc_conn_t or NULL (no allocation). */
+static pqc_conn_t *pqc_conn_get(const SSL *s)
+{
+    if (pqc_conn_ex_idx < 0) return NULL;
+    return SSL_get_ex_data(s, pqc_conn_ex_idx);
+}
+
 /* -------------------------------------------------------------------------
  * Verify callback — fires for each cert during ssl_verify_cert_chain().
  *
@@ -712,8 +719,7 @@ static int pqc_verify_cb(int preverify_ok, X509_STORE_CTX *ctx)
     EVP_PKEY *pkey;
 
     ssl = X509_STORE_CTX_get_ex_data(ctx, SSL_get_ex_data_X509_STORE_CTX_idx());
-    conn = (ssl != NULL && pqc_conn_ex_idx >= 0)
-           ? SSL_get_ex_data(ssl, pqc_conn_ex_idx) : NULL;
+    conn = (ssl != NULL) ? pqc_conn_get(ssl) : NULL;
 
     /* Run the previous verify callback first (if any). */
     if (conn != NULL && conn->prev_verify_cb != NULL)
@@ -762,12 +768,11 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
         pqc_conn_t *conn;
         long vresult;
 
-        if (pqc_conn_ex_idx < 0) return;
-        conn = SSL_get_ex_data(ssl, pqc_conn_ex_idx);
+        conn = pqc_conn_get(ssl);
         if (conn == NULL || conn->op == PQC_PENDING_NONE) return;
 
         vresult = SSL_get_verify_result(ssl);
-        if (conn->pctx != NULL && conn->pctx->debug_mask != 0)
+        if (conn->pctx->debug_mask != 0)
             fprintf(stderr, "pqc_continuity: handshake done, verify_result=%ld (%s), "
                     "pending_op=%d for %s:%d\n",
                     vresult, (vresult == X509_V_OK ? "OK" : "FAIL"),
@@ -778,13 +783,14 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
             return;
         }
 
-        if (conn->host[0] == '\0') {
-            /* No hostname — skip cache, but handshake succeeded. */
-        } else if (conn->op == PQC_PENDING_UPDATE)
-            pqc_cache_update(pqc_get_gcache(conn->pctx), conn->host, conn->port,
-                             conn->expiry, conn->pctx ? conn->pctx->debug_mask : 0);
-        else if (conn->op == PQC_PENDING_DELETE)
-            pqc_cache_delete(pqc_get_gcache(conn->pctx), conn->host, conn->port);
+        if (conn->host[0] != '\0') {
+            pqc_gcache_t *gc = pqc_get_gcache(conn->pctx);
+            if (conn->op == PQC_PENDING_UPDATE)
+                pqc_cache_update(gc, conn->host, conn->port,
+                                 conn->expiry, conn->pctx->debug_mask);
+            else if (conn->op == PQC_PENDING_DELETE)
+                pqc_cache_delete(gc, conn->host, conn->port);
+        }
 
         conn->op = PQC_PENDING_NONE;
     }
@@ -893,8 +899,7 @@ static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
 
     /* Server: only send CT if client included the CH extension (P1). */
     if (SSL_is_server(s)) {
-        pqc_conn_t *conn = (pqc_conn_ex_idx >= 0)
-                           ? SSL_get_ex_data(s, pqc_conn_ex_idx) : NULL;
+        pqc_conn_t *conn = pqc_conn_get(s);
         if (conn == NULL || !conn->client_sent_ch) {
             if (pctx->debug_mask != 0)
                 fprintf(stderr, "pqc_continuity: server skipping CT — client did not send CH\n");
@@ -914,7 +919,7 @@ static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
         unsigned char *buf;
         fprintf(stderr, "pqc_continuity: [debug] MALFORMED_EXT — sending 3-byte extension\n");
         buf = OPENSSL_malloc(3);
-        if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
+        if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return 0; }
         buf[0] = buf[1] = buf[2] = 0x42;
         *out = buf; *outlen = 3;
         return 1;
@@ -1031,7 +1036,8 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
         }
         if (pctx->debug_mask != 0)
             fprintf(stderr, "pqc_continuity: CT parse_cb deferring cache %s for %s:%d\n",
-                    validity == 0 ? "delete" : "update", host, port);
+                    validity == 0 ? "delete" : "update",
+                    have_key ? conn->host : "(no key)", have_key ? conn->port : 0);
     }
 
     return 1;
@@ -1097,7 +1103,6 @@ static int pqc_ctx_load_config(pqc_ctx_t *pctx,
     long eline = 0;
     int section_found = 0;
     const char *conffile = getenv("OPENSSL_CONF");
-    if (conffile == NULL) conffile = getenv("SSLEAY_CONF");
     if (conffile == NULL) return 0;
 
     conf = NCONF_new(NULL);
