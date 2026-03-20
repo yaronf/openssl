@@ -344,58 +344,47 @@ static uint16_t pqc_pkey_to_scheme(SSL_CTX *ctx, EVP_PKEY *pkey)
  * Per-connection host/port from SSL object
  * ---------------------------------------------------------------------- */
 
-static void pqc_get_host_port(SSL *s, char *host, size_t hostlen, int *port)
+/*
+ * Resolve the client's target hostname and remote port.  Must only be called
+ * on the client side.  SSL_get_servername() returns sc->ext.hostname — the
+ * SNI value set by the caller via SSL_set_tlsext_host_name().
+ * Port is resolved via getpeername() on the socket fd.
+ * Returns 0 on success, -1 if either hostname or port cannot be determined.
+ * On failure callers skip cache operations but still run protocol validation.
+ */
+static int pqc_client_get_host_port(SSL *s, char *host, size_t hostlen, int *port)
 {
-    const char *sni = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
-    BIO *rbio = SSL_get_rbio(s);
+    const char *h = SSL_get_servername(s, TLSEXT_NAMETYPE_host_name);
+    BIO *b;
+    int fd = -1;
 
-    /* Host: prefer SNI; fall back to BIO conn hostname. */
-    if (sni != NULL && sni[0] != '\0') {
-        snprintf(host, hostlen, "%s", sni);
-    } else {
-        const char *h = NULL;
-        BIO *b;
-        for (b = rbio; b != NULL; b = BIO_next(b)) {
-            h = BIO_get_conn_hostname(b);
-            if (h != NULL && h[0] != '\0')
-                break;
-        }
-        snprintf(host, hostlen, "%s", (h != NULL && h[0] != '\0') ? h : "localhost");
-    }
+    if (h == NULL || h[0] == '\0')
+        return -1;
+    snprintf(host, hostlen, "%s", h);
 
-    /*
-     * Port: use getpeername() on the underlying socket fd.
-     *
-     * BIO_get_conn_port() only works on BIO_s_connect BIOs.  The s_client app
-     * creates a raw socket and wraps it with BIO_new_socket(), so the BIO chain
-     * type is "socket" and BIO_get_conn_port() returns NULL.  Walking the chain
-     * doesn't help — there is no connect BIO anywhere.  getpeername() on the
-     * socket fd is the reliable cross-platform way to get the remote port.
-     */
-    *port = 443; /* default */
-    {
-        int fd = -1;
-        BIO *b;
-        for (b = rbio; b != NULL; b = BIO_next(b)) {
-            if (BIO_get_fd(b, &fd) > 0 && fd >= 0)
-                break;
-            fd = -1;
-        }
-        if (fd >= 0) {
-            union {
-                struct sockaddr sa;
-                struct sockaddr_in sin;
-                struct sockaddr_in6 sin6;
-            } addr;
-            socklen_t addrlen = sizeof(addr);
-            if (getpeername(fd, &addr.sa, &addrlen) == 0) {
-                if (addr.sa.sa_family == AF_INET)
-                    *port = ntohs(addr.sin.sin_port);
-                else if (addr.sa.sa_family == AF_INET6)
-                    *port = ntohs(addr.sin6.sin6_port);
+    for (b = SSL_get_rbio(s); b != NULL; b = BIO_next(b))
+        if (BIO_get_fd(b, &fd) > 0 && fd >= 0)
+            break;
+
+    if (fd >= 0) {
+        union {
+            struct sockaddr    sa;
+            struct sockaddr_in  sin;
+            struct sockaddr_in6 sin6;
+        } addr;
+        socklen_t addrlen = sizeof(addr);
+        if (getpeername(fd, &addr.sa, &addrlen) == 0) {
+            if (addr.sa.sa_family == AF_INET) {
+                *port = ntohs(addr.sin.sin_port);
+                return 0;
+            }
+            if (addr.sa.sa_family == AF_INET6) {
+                *port = ntohs(addr.sin6.sin6_port);
+                return 0;
             }
         }
     }
+    return -1;
 }
 
 /* -------------------------------------------------------------------------
@@ -798,7 +787,9 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
             return;
         }
 
-        if (conn->op == PQC_PENDING_UPDATE)
+        if (conn->host[0] == '\0') {
+            /* No hostname — skip cache, but handshake succeeded. */
+        } else if (conn->op == PQC_PENDING_UPDATE)
             pqc_cache_update(pqc_get_gcache(conn->pctx), conn->host, conn->port,
                              conn->expiry, conn->pctx ? conn->pctx->debug_mask : 0);
         else if (conn->op == PQC_PENDING_DELETE)
@@ -868,7 +859,8 @@ static int pqc_add_ch(SSL *s, pqc_ctx_t *pctx,
      * Cache hit: restrict to PQC-only sigalgs — core downgrade prevention.
      * Client won't offer traditional sigalgs to a previously-PQC server.
      */
-    pqc_get_host_port(s, host, sizeof(host), &port);
+    if (pqc_client_get_host_port(s, host, sizeof(host), &port) < 0)
+        return 1; /* no hostname/port; skip cache */
     if (pqc_cache_lookup(gc, host, port, &cached_expiry)) {
         char sigalgs[512];
         SSL_CTX *sctx = SSL_get_SSL_CTX(s);
@@ -1004,7 +996,7 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
                          X509 *x, size_t chainidx, int *al)
 {
     char host[256];
-    int port = 0;
+    int port = 0, have_key = 0;
     uint16_t scheme;
     uint32_t validity;
     pqc_conn_t *conn;
@@ -1021,7 +1013,13 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
         return 1;
     }
 
-    pqc_get_host_port(s, host, sizeof(host), &port);
+    /* Resolve cache key; -1 means skip cache but still validate. */
+    {
+        int r = !SSL_is_server(s)
+                ? pqc_client_get_host_port(s, host, sizeof(host), &port)
+                : -1;
+        have_key = (r == 0);
+    }
 
     if (inlen == 0) {
         /*
@@ -1029,7 +1027,7 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
          * If the client has a cache entry, this server previously had a PQC
          * cert — abort as a downgrade.
          */
-        if (!SSL_is_server(s)) {
+        if (have_key) {
             time_t cached_expiry = 0;
             if (pqc_cache_lookup(gc, host, port, &cached_expiry)) {
                 *al = SSL_AD_HANDSHAKE_FAILURE;
@@ -1066,12 +1064,15 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
     /*
      * Do NOT write the cache here — this fires before ssl_verify_cert_chain().
      * Record the intent; pqc_info_cb() flushes it at SSL_CB_HANDSHAKE_DONE
-     * after confirming X509_V_OK.
+     * after confirming X509_V_OK.  op must be set regardless of have_key so
+     * that pqc_verify_cb can enforce the mixed-chain check.
      */
     conn = pqc_conn_get_or_create(s, pctx);
     if (conn != NULL) {
-        snprintf(conn->host, sizeof(conn->host), "%s", host);
-        conn->port = port;
+        if (have_key) {
+            snprintf(conn->host, sizeof(conn->host), "%s", host);
+            conn->port = port;
+        }
         if (validity == 0) {
             conn->op = PQC_PENDING_DELETE;
         } else {
