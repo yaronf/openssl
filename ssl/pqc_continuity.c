@@ -736,7 +736,8 @@ static int pqc_verify_cb(int preverify_ok, X509_STORE_CTX *ctx)
         char subj[256] = "(unknown)";
         if (cert)
             X509_NAME_oneline(X509_get_subject_name(cert), subj, sizeof(subj));
-        fprintf(stderr, "pqc_continuity: mixed chain: non-PQC cert \"%s\" — aborting\n", subj);
+        ERR_raise_data(ERR_LIB_SSL, SSL_R_CERTIFICATE_VERIFY_FAILED,
+                       "pqc_continuity: mixed chain: non-PQC cert \"%s\"", subj);
         X509_STORE_CTX_set_error(ctx, X509_V_ERR_CERT_REJECTED);
         return 0;
     }
@@ -811,7 +812,7 @@ static int pqc_encode_ct_ext(uint32_t validity,
                               const unsigned char **out, size_t *outlen)
 {
     unsigned char *buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
-    if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return 0; }
+    if (buf == NULL) { ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE); *al = SSL_AD_INTERNAL_ERROR; return 0; }
     buf[0] = (validity >> 24) & 0xff;
     buf[1] = (validity >> 16) & 0xff;
     buf[2] = (validity >>  8) & 0xff;
@@ -920,7 +921,7 @@ static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
         unsigned char *buf;
         fprintf(stderr, "pqc_continuity: [debug] MALFORMED_EXT — sending 3-byte extension\n");
         buf = OPENSSL_malloc(3);
-        if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return 0; }
+        if (buf == NULL) { ERR_raise(ERR_LIB_SSL, ERR_R_MALLOC_FAILURE); *al = SSL_AD_INTERNAL_ERROR; return 0; }
         buf[0] = buf[1] = buf[2] = 0x42;
         *out = buf; *outlen = 3;
         return 1;
@@ -980,8 +981,9 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
     if (chainidx != 0) {
         /* CT extension on a non-EE CertificateEntry is a protocol violation. */
         if (!SSL_is_server(s)) {
-            fprintf(stderr, "pqc_continuity: CT extension on chainidx %zu (not EE) — aborting\n",
-                    chainidx);
+            ERR_raise_data(ERR_LIB_SSL, SSL_R_BAD_EXTENSION,
+                           "pqc_continuity: CT extension on chainidx %zu (not EE)",
+                           chainidx);
             *al = SSL_AD_ILLEGAL_PARAMETER;
             return 0;
         }
@@ -1001,14 +1003,22 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
         if (have_key) {
             time_t cached_expiry = 0;
             if (pqc_cache_lookup(gc, host, port, &cached_expiry)) {
+                ERR_raise_data(ERR_LIB_SSL, SSL_R_INAPPROPRIATE_FALLBACK,
+                               "pqc_continuity: downgrade detected for %s:%d", host, port);
                 *al = SSL_AD_HANDSHAKE_FAILURE;
-                return 0; /* downgrade detected */
+                return 0;
             }
         }
         return 1;
     }
 
-    if (inlen != PQC_EXT_DATA_LEN) { *al = SSL_AD_DECODE_ERROR; return 0; }
+    if (inlen != PQC_EXT_DATA_LEN) {
+        ERR_raise_data(ERR_LIB_SSL, SSL_R_BAD_EXTENSION,
+                       "pqc_continuity: CT extension length %zu (expected %d)",
+                       inlen, PQC_EXT_DATA_LEN);
+        *al = SSL_AD_DECODE_ERROR;
+        return 0;
+    }
 
     validity = ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16)
              | ((uint32_t)in[2] <<  8) |  (uint32_t)in[3];
