@@ -58,8 +58,8 @@
 /* PEM block type for cache entries. */
 #define PQC_PEM_TYPE  "PQC CERT AVAILABLE CACHE"
 
-/* Extension wire size: 2 bytes sigalg + 4 bytes validity_period. */
-#define PQC_EXT_DATA_LEN  6
+/* Extension wire size: 4 bytes validity_period (signature_algorithm dropped). */
+#define PQC_EXT_DATA_LEN  4
 
 /* Initial allocation for in-memory cache entries. */
 #define PQC_CACHE_INIT  4
@@ -84,10 +84,7 @@ typedef struct {
  * Debug bitmask (Debug config key, hex) for fault injection in tests.
  * See docs/POC-PLAN.md § Debug Bitmask.
  */
-#define PQC_DEBUG_WRONG_SCHEME     0x02  /* server sends mismatched PQC scheme */
-#define PQC_DEBUG_LEGACY_SCHEME    0x04  /* server sends RSA scheme in CT */
 #define PQC_DEBUG_MALFORMED_EXT    0x08  /* server sends wrong-length CT ext */
-#define PQC_DEBUG_UNKNOWN_SCHEME        0x10  /* server sends unregistered scheme */
 #define PQC_DEBUG_CT_ON_INTERMEDIATE    0x40  /* server sends CT on both EE (chainidx 0) AND intermediate (chainidx 1) */
 #define PQC_DEBUG_CT_ONLY_INTERMEDIATE  0x80  /* server sends CT on intermediate (chainidx 1) ONLY, skipping EE */
 
@@ -181,7 +178,7 @@ DEFINE_RUN_ONCE_STATIC(pqc_ex_idx_init)
  *
  * Static table of all known NIST PQC sigalgs with IANA-assigned TLS
  * SignatureScheme values.  Algorithms not yet supported by the current
- * OpenSSL build are silently skipped (pqc_pkey_to_scheme returns 0 for them)
+ * OpenSSL build are silently skipped (pqc_is_pqc_cert returns 0 for them)
  * and activate automatically once the build adds support.
  *
  * The bar to add an algorithm here is intentionally low: the TLS stack
@@ -236,8 +233,7 @@ static pqc_alg_t pqc_alg_registry[] = {
  * Dynamic sigalg registry — runtime extension via pqc_cont_register_sigalg().
  * Protected by pqc_dyn_lock (readers during lookup, writer during registration).
  * Note: the registry is used only for pqc_build_sigalgs_list() and
- * pqc_pkey_to_scheme(); parse_cb validation is done by cert-key comparison,
- * not by registry membership.
+ * pqc_is_pqc_cert(); parse_cb no longer validates scheme (field dropped).
  */
 static pqc_alg_t    *pqc_dyn_registry  = NULL;
 static int           pqc_dyn_nalloc    = 0;
@@ -306,23 +302,18 @@ static const pqc_alg_t *pqc_alg_by_scheme(uint16_t scheme)
 }
 
 /*
- * Map a pkey to its TLS SignatureScheme value by matching the pkey's base NID
- * against the SSL_CTX's sigalg_lookup_cache.  Name matching is unreliable
- * because EVP_PKEY_get0_type_name() returns the OID long name (e.g.
- * "ML-DSA-44") while sigalg_lookup_cache uses the TLS name (e.g. "mldsa44").
+ * Return 1 if pkey belongs to a PQC algorithm in the registry, 0 otherwise.
+ * Uses ssl_cert_lookup_by_pkey() (NID-safe for provider keys such as ML-DSA)
+ * and walks sigalg_lookup_cache to check whether the resolved NID maps to a
+ * registered PQC SignatureScheme.
  */
-static uint16_t pqc_pkey_to_scheme(SSL_CTX *ctx, EVP_PKEY *pkey)
+static int pqc_is_pqc_cert(SSL_CTX *ctx, EVP_PKEY *pkey)
 {
     int nid = NID_undef;
     size_t i;
 
     if (pkey == NULL) return 0;
 
-    /*
-     * For provider-based keys (e.g. ML-DSA), EVP_PKEY_get_base_id() returns
-     * NID_undef.  Use ssl_cert_lookup_by_pkey() instead, which uses
-     * EVP_PKEY_is_a() against OID short/long names and handles provider keys.
-     */
     {
         const SSL_CERT_LOOKUP *scl = ssl_cert_lookup_by_pkey(pkey, NULL, ctx);
         if (scl != NULL)
@@ -334,7 +325,7 @@ static uint16_t pqc_pkey_to_scheme(SSL_CTX *ctx, EVP_PKEY *pkey)
         const SIGALG_LOOKUP *lu = &ctx->sigalg_lookup_cache[i];
         if (lu->sig == nid && lu->sigalg != 0
                 && pqc_alg_by_scheme(lu->sigalg) != NULL)
-            return lu->sigalg;
+            return 1;
     }
     return 0;
 }
@@ -734,7 +725,7 @@ static int pqc_verify_cb(int preverify_ok, X509_STORE_CTX *ctx)
     /* Mixed-chain check: current cert must be PQC. */
     cert = X509_STORE_CTX_get_current_cert(ctx);
     pkey = cert ? X509_get0_pubkey(cert) : NULL;
-    if (pqc_pkey_to_scheme(SSL_get_SSL_CTX(ssl), pkey) == 0) {
+    if (!pqc_is_pqc_cert(SSL_get_SSL_CTX(ssl), pkey)) {
         char subj[256] = "(unknown)";
         if (cert)
             X509_NAME_oneline(X509_get_subject_name(cert), subj, sizeof(subj));
@@ -804,22 +795,20 @@ static void pqc_info_cb(const SSL *ssl, int where, int ret)
  * ---------------------------------------------------------------------- */
 
 /*
- * Allocate and fill a 6-byte CT extension buffer: uint16 scheme + uint32 validity.
+ * Allocate and fill a 4-byte CT extension buffer: uint32 validity_period.
  * Sets *out/*outlen on success; sets *al = SSL_AD_INTERNAL_ERROR and returns 0 on
  * alloc failure.  Returns 1 on success.
  */
-static int pqc_encode_ct_ext(uint16_t scheme, uint32_t validity,
+static int pqc_encode_ct_ext(uint32_t validity,
                               int *al,
                               const unsigned char **out, size_t *outlen)
 {
     unsigned char *buf = OPENSSL_malloc(PQC_EXT_DATA_LEN);
     if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return 0; }
-    buf[0] = (scheme >> 8) & 0xff;
-    buf[1] =  scheme       & 0xff;
-    buf[2] = (validity >> 24) & 0xff;
-    buf[3] = (validity >> 16) & 0xff;
-    buf[4] = (validity >>  8) & 0xff;
-    buf[5] =  validity        & 0xff;
+    buf[0] = (validity >> 24) & 0xff;
+    buf[1] = (validity >> 16) & 0xff;
+    buf[2] = (validity >>  8) & 0xff;
+    buf[3] =  validity        & 0xff;
     *out = buf; *outlen = PQC_EXT_DATA_LEN;
     return 1;
 }
@@ -880,14 +869,13 @@ static int pqc_add_ch(SSL *s, pqc_ctx_t *pctx,
     return 1;
 }
 
-/* --- CT add: server encodes scheme + validity (with debug fault injection) --- */
+/* --- CT add: server encodes validity (with debug fault injection) --- */
 static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
                       X509 *x, size_t chainidx,
                       int *al,
                       const unsigned char **out, size_t *outlen)
 {
     EVP_PKEY *pkey;
-    uint16_t scheme;
 
     /* Debug chainidx routing: normal path allows EE (chainidx 0) only.
      * CT_ONLY_INTERMEDIATE (A4b): send on chainidx 1, skip 0.
@@ -915,40 +903,21 @@ static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
     }
 
     pkey = (x != NULL) ? X509_get0_pubkey(x) : NULL;
-    scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
-    if (scheme == 0) {
+    if (!pqc_is_pqc_cert(SSL_get_SSL_CTX(s), pkey)) {
         /* Traditional cert: empty extension signals presence only. */
         *out = NULL; *outlen = 0;
         return 1;
     }
 
-    /* Debug fault injection — wrong/legacy/unknown scheme or malformed length. */
-    if (pctx->debug_mask & PQC_DEBUG_WRONG_SCHEME) {
-        uint16_t wrong;
-        fprintf(stderr, "pqc_continuity: [debug] WRONG_SCHEME — sending mismatched scheme\n");
-        if      (scheme == PQC_MLDSA44) wrong = PQC_MLDSA65;
-        else if (scheme == PQC_MLDSA65) wrong = PQC_MLDSA87;
-        else                             wrong = PQC_MLDSA44;
-        return pqc_encode_ct_ext(wrong, pctx->validity_period, al, out, outlen);
-    }
-    if (pctx->debug_mask & PQC_DEBUG_LEGACY_SCHEME) {
-        fprintf(stderr, "pqc_continuity: [debug] LEGACY_SCHEME — sending RSA scheme 0x0401\n");
-        return pqc_encode_ct_ext(0x0401, pctx->validity_period, al, out, outlen);
-    }
+    /* Debug fault injection — malformed length. */
     if (pctx->debug_mask & PQC_DEBUG_MALFORMED_EXT) {
         unsigned char *buf;
         fprintf(stderr, "pqc_continuity: [debug] MALFORMED_EXT — sending 3-byte extension\n");
         buf = OPENSSL_malloc(3);
         if (buf == NULL) { *al = SSL_AD_INTERNAL_ERROR; return -1; }
-        buf[0] = (scheme >> 8) & 0xff;
-        buf[1] =  scheme       & 0xff;
-        buf[2] = 0x42;
+        buf[0] = buf[1] = buf[2] = 0x42;
         *out = buf; *outlen = 3;
         return 1;
-    }
-    if (pctx->debug_mask & PQC_DEBUG_UNKNOWN_SCHEME) {
-        fprintf(stderr, "pqc_continuity: [debug] UNKNOWN_SCHEME — sending scheme 0xFE42\n");
-        return pqc_encode_ct_ext(0xFE42, pctx->validity_period, al, out, outlen);
     }
 
     /*
@@ -956,7 +925,7 @@ static int pqc_add_ct(SSL *s, pqc_ctx_t *pctx,
      * cache; must send full extension (not empty) to distinguish from a
      * traditional-cert presence signal.
      */
-    return pqc_encode_ct_ext(scheme, pctx->validity_period, al, out, outlen);
+    return pqc_encode_ct_ext(pctx->validity_period, al, out, outlen);
 }
 
 static int pqc_add_cb(SSL *s, unsigned int ext_type,
@@ -991,14 +960,13 @@ static void pqc_free_cb(SSL *s, unsigned int ext_type,
         OPENSSL_free((void *)out);
 }
 
-/* --- CT parse: client validates scheme vs cert, defers cache write --- */
+/* --- CT parse: client reads validity, defers cache write --- */
 static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
                          const unsigned char *in, size_t inlen,
                          X509 *x, size_t chainidx, int *al)
 {
     char host[256];
     int port = 0, have_key = 0;
-    uint16_t scheme;
     uint32_t validity;
     pqc_conn_t *conn;
     pqc_gcache_t *gc = pqc_get_gcache(pctx);
@@ -1040,27 +1008,8 @@ static int pqc_parse_ct(SSL *s, pqc_ctx_t *pctx,
 
     if (inlen != PQC_EXT_DATA_LEN) { *al = SSL_AD_DECODE_ERROR; return 0; }
 
-    scheme   = ((uint16_t)in[0] << 8) | (uint16_t)in[1];
-    validity = ((uint32_t)in[2] << 24) | ((uint32_t)in[3] << 16)
-             | ((uint32_t)in[4] <<  8) |  (uint32_t)in[5];
-
-    /*
-     * The scheme must exactly match the cert's public key.  Any deviation
-     * (wrong PQC alg, legacy alg, unknown value) is treated as tampering.
-     * No forward-compat carve-out: if the server sends this extension it must
-     * be consistent with the cert it is presenting.
-     */
-    if (!SSL_is_server(s)) {
-        EVP_PKEY *pkey = x != NULL ? X509_get0_pubkey(x) : NULL;
-        uint16_t cert_scheme = pqc_pkey_to_scheme(SSL_get_SSL_CTX(s), pkey);
-        if (cert_scheme == 0 || cert_scheme != scheme) {
-            fprintf(stderr, "pqc_continuity: CT parse_cb scheme mismatch: "
-                    "extension=0x%04x cert=0x%04x — aborting\n",
-                    scheme, cert_scheme);
-            *al = SSL_AD_ILLEGAL_PARAMETER;
-            return 0;
-        }
-    }
+    validity = ((uint32_t)in[0] << 24) | ((uint32_t)in[1] << 16)
+             | ((uint32_t)in[2] <<  8) |  (uint32_t)in[3];
 
     /*
      * Do NOT write the cache here — this fires before ssl_verify_cert_chain().
