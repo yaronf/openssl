@@ -680,7 +680,11 @@ static pqc_conn_t *pqc_conn_get_or_create(SSL *s, pqc_ctx_t *pctx)
 {
     pqc_conn_t *conn;
 
-    if (pqc_conn_ex_idx < 0) return NULL;
+    if (pqc_conn_ex_idx < 0) {
+        ERR_raise_data(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR,
+                       "pqc_continuity: ex_data index not initialised");
+        return NULL;
+    }
     conn = SSL_get_ex_data(s, pqc_conn_ex_idx);
     if (conn != NULL) return conn;
 
@@ -697,7 +701,11 @@ static pqc_conn_t *pqc_conn_get_or_create(SSL *s, pqc_ctx_t *pctx)
 /* Read-only variant: return existing pqc_conn_t or NULL (no allocation). */
 static pqc_conn_t *pqc_conn_get(const SSL *s)
 {
-    if (pqc_conn_ex_idx < 0) return NULL;
+    if (pqc_conn_ex_idx < 0) {
+        ERR_raise_data(ERR_LIB_SSL, ERR_R_INTERNAL_ERROR,
+                       "pqc_continuity: ex_data index not initialised");
+        return NULL;
+    }
     return SSL_get_ex_data(s, pqc_conn_ex_idx);
 }
 
@@ -1146,8 +1154,11 @@ static int pqc_ctx_load_config(pqc_ctx_t *pctx,
         if (val != NULL) {
             section_found = 1;
             pctx->debug_mask = (uint32_t)strtoul(val, NULL, 16);
-            if (pctx->debug_mask != 0)
+            if (pctx->debug_mask & ~PQC_DEBUG_VERBOSE)
                 fprintf(stderr, "pqc_continuity: debug_mask=0x%02x (fault injection active)\n",
+                        pctx->debug_mask);
+            else if (pctx->debug_mask & PQC_DEBUG_VERBOSE)
+                fprintf(stderr, "pqc_continuity: debug_mask=0x%02x (verbose trace enabled)\n",
                         pctx->debug_mask);
         } else { ERR_clear_error(); }
     }
