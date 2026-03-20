@@ -846,6 +846,7 @@ static int pqc_add_ch(SSL *s, pqc_ctx_t *pctx,
     pqc_gcache_t *gc = pqc_get_gcache(pctx);
 
     if (SSL_is_server(s)) return 0;
+    if (SSL_version(s) != TLS1_3_VERSION) return 0;
 
     /* Install info callback (chains CTX-level) and verify callback (mixed-chain). */
     SSL_set_info_callback(s, pqc_info_cb);
@@ -1097,6 +1098,7 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
     pqc_conn_t *conn;
 
     if (pctx == NULL) return 1;
+    if (SSL_version(s) != TLS1_3_VERSION) return 1;
 
     if (context & SSL_EXT_CLIENT_HELLO) {
         /* Server notes that client supports the extension. */
