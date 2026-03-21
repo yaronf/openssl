@@ -552,7 +552,8 @@ static int pqc_cache_update(pqc_gcache_t *gc, const char *host, int port,
         snprintf(gc->entries[i].host, sizeof(gc->entries[i].host), "%s", host);
         gc->entries[i].port = port;
     } else if (expiry < gc->entries[i].expiry) {
-        /* Draft 3.3: SHOULD NOT accept a decrease in validity period. */
+        /* Draft 3.3: SHOULD NOT accept a decrease in validity period.
+         * Silently keep the cached (longer) expiry; handshake continues. */
         if (debug_mask != 0)
             fprintf(stderr, "pqc_continuity: ignoring validity decrease for %s:%d "
                     "(cached=%ld, offered=%ld)\n",
