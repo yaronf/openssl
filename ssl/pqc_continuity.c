@@ -150,7 +150,6 @@ typedef struct {
     int              port;
     time_t           expiry;       /* only valid for PQC_PENDING_UPDATE */
     int              client_sent_ch; /* server-side: 1 if client included CH ext */
-    int              server_sent_cr; /* client-side: 1 if server included CR ext */
     int (*prev_verify_cb)(int, X509_STORE_CTX *); /* chained verify callback */
 } pqc_conn_t;
 
@@ -1080,14 +1079,8 @@ static int pqc_parse_cb(SSL *s, unsigned int ext_type,
         return 1;
     }
 
-    if (context & SSL_EXT_TLS1_3_CERTIFICATE_REQUEST) {
-        if (!SSL_is_server(s)) {
-            conn = pqc_conn_get_or_create(s, pctx);
-            if (conn != NULL)
-                conn->server_sent_cr = 1;
-        }
-        return 1;
-    }
+    if (context & SSL_EXT_TLS1_3_CERTIFICATE_REQUEST)
+        return 1; /* presence signal only; client auth not implemented */
 
     if (context & SSL_EXT_TLS1_3_CERTIFICATE)
         return pqc_parse_ct(s, pctx, in, inlen, x, chainidx, al);
